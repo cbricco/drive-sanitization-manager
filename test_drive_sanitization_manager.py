@@ -8,6 +8,8 @@ from pathlib import Path
 from drive_sanitization_manager import (
     BatchRecord,
     DriveRecord,
+    DuplicateIdentifierError,
+    InvalidStatusTransitionError,
     MalformedRecordError,
     OutputExistsError,
     UnsupportedSchemaVersionError,
@@ -138,6 +140,72 @@ class RecordsFoundationTests(unittest.TestCase):
         batch.drives[0].sanitization_status = "probably fine"
         with self.assertRaisesRegex(MalformedRecordError, "sanitization_status"):
             batch.validate()
+
+
+    def test_technician_intake_workflow_does_not_claim_sanitization(self):
+        batch = self.make_batch()
+        for drive in batch.drives:
+            drive.transition_intake("in_progress")
+            drive.transition_intake("complete")
+        batch.transition_intake("in_progress")
+        batch.transition_intake("complete")
+        self.assertEqual(batch.intake_status, "complete")
+        self.assertTrue(all(drive.intake_status == "complete" for drive in batch.drives))
+        self.assertEqual(batch.drives[0].sanitization_status, "failed")
+        self.assertEqual(batch.drives[1].sanitization_status, "incomplete")
+
+    def test_invalid_and_premature_intake_transitions_are_rejected(self):
+        batch = self.make_batch()
+        with self.assertRaises(InvalidStatusTransitionError):
+            batch.transition_intake("complete")
+        with self.assertRaises(InvalidStatusTransitionError):
+            batch.drives[0].transition_intake("complete")
+        with self.assertRaisesRegex(MalformedRecordError, "intake_status"):
+            batch.drives[0].transition_intake("invented")
+
+    def test_add_drive_rejects_duplicate_identifiers_and_rolls_back(self):
+        batch = self.make_batch()
+        duplicate = DriveRecord(
+            internal_record_id="DRV-SYN-003", batch_job_id=batch.batch_job_id,
+            serial_number="  syn-serial-001  ",
+        )
+        with self.assertRaisesRegex(DuplicateIdentifierError, "serial_number"):
+            batch.add_drive(duplicate)
+        self.assertEqual(len(batch.drives), 2)
+        self.assertEqual(batch.total_drive_count, 2)
+
+    def test_add_drive_validates_required_fields_and_batch_membership(self):
+        batch = self.make_batch()
+        with self.assertRaisesRegex(MalformedRecordError, "internal_record_id"):
+            batch.add_drive(DriveRecord(internal_record_id=" ", batch_job_id=batch.batch_job_id))
+        with self.assertRaisesRegex(MalformedRecordError, "does not match"):
+            batch.add_drive(DriveRecord(internal_record_id="DRV-SYN-003", batch_job_id="OTHER-SYN"))
+
+    def test_job1_json_without_intake_fields_remains_loadable(self):
+        data = asdict(self.make_batch())
+        data.pop("intake_status")
+        data.pop("intake_review_notes")
+        for drive in data["drives"]:
+            drive.pop("intake_status")
+            drive.pop("intake_review_notes")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "job1.json"
+            path.write_text(json.dumps(data), encoding="utf-8")
+            loaded = load_json(path)
+        self.assertEqual(loaded.intake_status, "pending")
+        self.assertTrue(all(drive.intake_status == "pending" for drive in loaded.drives))
+
+    def test_csv_reports_batch_and_drive_intake_statuses(self):
+        batch = self.make_batch()
+        batch.intake_status = "in_progress"
+        batch.drives[0].intake_status = "review_needed"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "intake.csv"
+            export_csv(batch, path)
+            with path.open(encoding="utf-8-sig", newline="") as stream:
+                rows = list(csv.DictReader(stream))
+        self.assertEqual(rows[0]["batch_intake_status"], "in_progress")
+        self.assertEqual(rows[0]["drive_intake_status"], "review_needed")
 
 
 if __name__ == "__main__":

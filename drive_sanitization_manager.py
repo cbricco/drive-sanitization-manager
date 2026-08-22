@@ -33,11 +33,26 @@ class OutputExistsError(FileExistsError):
     """An output was protected from being overwritten."""
 
 
+class DuplicateIdentifierError(RecordError):
+    """An intake identifier is already present in the batch."""
+
+
+class InvalidStatusTransitionError(RecordError):
+    """An intake workflow status transition is not permitted."""
+
+
 BATCH_STATUSES = {"received", "in_progress", "complete", "failed", "incomplete", "review_needed"}
 ELIGIBILITY_STATUSES = {"unknown", "eligible", "ineligible", "review_needed"}
 SANITIZATION_STATUSES = {"not_started", "in_progress", "succeeded", "failed", "incomplete", "review_needed"}
 VERIFICATION_RESULTS = {"not_performed", "passed", "failed", "incomplete", "review_needed"}
 FINAL_STATUSES = {"pending", "complete", "failed", "incomplete", "review_needed"}
+INTAKE_STATUSES = {"pending", "in_progress", "review_needed", "complete"}
+INTAKE_TRANSITIONS = {
+    "pending": {"in_progress", "review_needed"},
+    "in_progress": {"review_needed", "complete"},
+    "review_needed": {"in_progress", "complete"},
+    "complete": set(),
+}
 
 
 def _require_text(value: Any, name: str) -> None:
@@ -53,6 +68,20 @@ def _optional_text(value: Any, name: str) -> None:
 def _status(value: Any, name: str, allowed: set[str]) -> None:
     if value not in allowed:
         raise MalformedRecordError(f"{name} must be one of: {', '.join(sorted(allowed))}")
+
+
+def _transition(current: str, target: str, name: str) -> str:
+    _status(target, name, INTAKE_STATUSES)
+    if target == current:
+        return current
+    if target not in INTAKE_TRANSITIONS[current]:
+        raise InvalidStatusTransitionError(f"cannot change {name} from {current!r} to {target!r}")
+    return target
+
+
+def _identifier(value: Optional[str]) -> Optional[str]:
+    """Normalize supplied identifiers for duplicate comparison only."""
+    return value.strip().casefold() if isinstance(value, str) and value.strip() else None
 
 
 def _write_new(path: os.PathLike[str] | str, content: bytes) -> None:
@@ -134,6 +163,10 @@ class DriveRecord:
     disposition_classification: Optional[str] = None
     disposition_notes: Optional[str] = None
 
+    # Intake completion records inventory work only; it never represents a wipe.
+    intake_status: str = "pending"
+    intake_review_notes: Optional[str] = None
+
     _OPTIONAL_BOOL_FIELDS: ClassVar[set[str]] = {"mounted", "system_protected", "verification_required"}
     _DICT_FIELDS: ClassVar[set[str]] = {"sanitization_measurements", "evidence_hashes"}
 
@@ -153,6 +186,7 @@ class DriveRecord:
         _status(self.sanitization_status, "sanitization_status", SANITIZATION_STATUSES)
         _status(self.verification_result, "verification_result", VERIFICATION_RESULTS)
         _status(self.final_status, "final_status", FINAL_STATUSES)
+        _status(self.intake_status, "intake_status", INTAKE_STATUSES)
         if not isinstance(self.sanitization_measurements, dict):
             raise MalformedRecordError("sanitization_measurements must be an object")
         if not isinstance(self.evidence_hashes, dict) or not all(
@@ -160,18 +194,27 @@ class DriveRecord:
         ):
             raise MalformedRecordError("evidence_hashes must be an object containing string values")
 
+    def transition_intake(self, status: str) -> None:
+        """Apply a controlled intake transition without changing sanitization state."""
+        self.validate()
+        self.intake_status = _transition(self.intake_status, status, "intake_status")
+
     @classmethod
     def from_dict(cls, data: Any) -> "DriveRecord":
         if not isinstance(data, dict):
             raise MalformedRecordError("each drive must be a JSON object")
         expected = {item.name for item in fields(cls)}
-        missing = expected - data.keys()
-        unknown = data.keys() - expected
+        # Job 1 JSON omitted intake fields; defaults preserve compatibility.
+        values = dict(data)
+        values.setdefault("intake_status", "pending")
+        values.setdefault("intake_review_notes", None)
+        missing = expected - values.keys()
+        unknown = values.keys() - expected
         if missing:
             raise MalformedRecordError(f"drive record is missing fields: {', '.join(sorted(missing))}")
         if unknown:
             raise MalformedRecordError(f"drive record has unknown fields: {', '.join(sorted(unknown))}")
-        record = cls(**data)
+        record = cls(**values)
         record.validate()
         return record
 
@@ -195,6 +238,8 @@ class BatchRecord:
     drives: List[DriveRecord] = field(default_factory=list)
     schema_version: int = SCHEMA_VERSION
     total_drive_count: Optional[int] = None
+    intake_status: str = "pending"
+    intake_review_notes: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.total_drive_count is None:
@@ -215,22 +260,61 @@ class BatchRecord:
         for name in ("authorization_reference_notes", "processing_date", "final_batch_disposition", "general_notes"):
             _optional_text(getattr(self, name), name)
         _status(self.overall_batch_status, "overall_batch_status", BATCH_STATUSES)
+        _status(self.intake_status, "intake_status", INTAKE_STATUSES)
+        _optional_text(self.intake_review_notes, "intake_review_notes")
         if type(self.total_drive_count) is not int or self.total_drive_count < 0:
             raise MalformedRecordError("total_drive_count must be a non-negative integer")
         if not isinstance(self.drives, list):
             raise MalformedRecordError("drives must be an array")
         if self.total_drive_count != len(self.drives):
             raise MalformedRecordError("total_drive_count does not match the number of drives")
-        seen: set[str] = set()
+        seen: Dict[str, set[str]] = {
+            "internal_record_id": set(),
+            "customer_asset_tag": set(),
+            "serial_number": set(),
+            "stable_device_identifier": set(),
+        }
         for drive in self.drives:
             if not isinstance(drive, DriveRecord):
                 raise MalformedRecordError("drives must contain DriveRecord values")
             drive.validate()
             if drive.batch_job_id != self.batch_job_id:
                 raise MalformedRecordError("drive batch_job_id does not match its batch")
-            if drive.internal_record_id in seen:
-                raise MalformedRecordError("internal_record_id values must be unique within a batch")
-            seen.add(drive.internal_record_id)
+            for name, values in seen.items():
+                normalized = _identifier(getattr(drive, name))
+                if normalized is not None and normalized in values:
+                    raise DuplicateIdentifierError(f"{name} values must be unique within a batch")
+                if normalized is not None:
+                    values.add(normalized)
+
+    def add_drive(self, drive: DriveRecord) -> None:
+        """Validate and add one technician-supplied drive intake record."""
+        if self.intake_status == "complete":
+            raise InvalidStatusTransitionError("cannot add a drive to a completed intake batch")
+        if not isinstance(drive, DriveRecord):
+            raise MalformedRecordError("drive must be a DriveRecord")
+        if drive.batch_job_id != self.batch_job_id:
+            raise MalformedRecordError("drive batch_job_id does not match its batch")
+        previous_count = self.total_drive_count
+        self.drives.append(drive)
+        self.total_drive_count = len(self.drives)
+        try:
+            self.validate()
+        except Exception:
+            self.drives.pop()
+            self.total_drive_count = previous_count
+            raise
+        if self.intake_status == "pending":
+            self.intake_status = "in_progress"
+
+    def transition_intake(self, status: str) -> None:
+        """Move the batch through intake after validating all supplied records."""
+        self.validate()
+        if status == "complete" and not self.drives:
+            raise InvalidStatusTransitionError("cannot complete intake for a batch with no drives")
+        if status == "complete" and any(drive.intake_status != "complete" for drive in self.drives):
+            raise InvalidStatusTransitionError("cannot complete batch intake until every drive intake is complete")
+        self.intake_status = _transition(self.intake_status, status, "intake_status")
 
     def to_dict(self) -> Dict[str, Any]:
         self.validate()
@@ -248,16 +332,18 @@ class BatchRecord:
                 f"unsupported schema version {version!r}; supported version is {SCHEMA_VERSION}"
             )
         expected = {item.name for item in fields(cls)}
-        missing = expected - data.keys()
-        unknown = data.keys() - expected
+        values = dict(data)
+        values.setdefault("intake_status", "pending")
+        values.setdefault("intake_review_notes", None)
+        missing = expected - values.keys()
+        unknown = values.keys() - expected
         if missing:
             raise MalformedRecordError(f"batch record is missing fields: {', '.join(sorted(missing))}")
         if unknown:
             raise MalformedRecordError(f"batch record has unknown fields: {', '.join(sorted(unknown))}")
-        raw_drives = data.get("drives")
+        raw_drives = values.get("drives")
         if not isinstance(raw_drives, list):
             raise MalformedRecordError("drives must be an array")
-        values = dict(data)
         values["drives"] = [DriveRecord.from_dict(item) for item in raw_drives]
         record = cls(**values)
         record.validate()
@@ -272,7 +358,8 @@ CSV_FIELDS = [
     "sanitization_method", "sanitization_result", "sanitization_failure_error", "sanitization_start_timestamp",
     "sanitization_end_timestamp", "verification_required", "verification_method", "verification_result",
     "verification_failure_details", "verification_timestamp", "final_status", "final_disposition",
-    "disposition_timestamp", "disposition_classification",
+    "disposition_timestamp", "disposition_classification", "batch_intake_status",
+    "batch_intake_review_notes", "drive_intake_status", "drive_intake_review_notes",
 ]
 
 
@@ -310,5 +397,11 @@ def export_csv(batch: BatchRecord, path: os.PathLike[str] | str) -> None:
         row = {name: batch_values.get(name) for name in CSV_FIELDS}
         drive_values = asdict(drive)
         row.update({name: drive_values.get(name) for name in CSV_FIELDS if name in drive_values})
+        row.update({
+            "batch_intake_status": batch.intake_status,
+            "batch_intake_review_notes": batch.intake_review_notes,
+            "drive_intake_status": drive.intake_status,
+            "drive_intake_review_notes": drive.intake_review_notes,
+        })
         writer.writerow(row)
     _write_new(path, output.getvalue().encode("utf-8-sig"))
