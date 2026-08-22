@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# IDE / editor
+.vscode/
+.idea/
+*~
+
+# Real customer / runtime data must never enter the public repository
+.private/
+customer-data/
+runtime-data/
+reports/private/
+logs/private/
+
+# Local environment/configuration
+.env
+.env.*
