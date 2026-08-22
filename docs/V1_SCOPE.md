@@ -2,16 +2,20 @@
 
 ## Purpose
 
-Build the non-destructive recordkeeping foundation for Drive Sanitization
-Manager.
+Build the non-destructive recordkeeping and technician-intake foundation for
+Drive Sanitization Manager.
 
-The first implementation must operate entirely on synthetic data and must not
-access, alter, sanitize, mount, unmount, or otherwise operate on real storage
-devices.
+The current Version 1 work operates entirely on manually supplied or synthetic
+drive information. It must not access, alter, sanitize, mount, unmount, or
+otherwise operate on real storage devices.
 
-## Phase 2 Auto Lab Job 1
+The records foundation and technician-facing command-line workflow are now
+implemented. Physical-drive discovery and destructive operations remain later,
+separately reviewed phases.
 
-Implement:
+## Implemented Records Foundation
+
+The records foundation provides:
 
 1. A batch record model.
 2. A per-drive record model.
@@ -21,6 +25,32 @@ Implement:
 6. Validation of required identifiers and statuses.
 7. Focused automated tests.
 8. Synthetic examples/fixtures only.
+
+## Phase 3 Technician CLI
+
+The implemented technician-facing command-line workflow adds non-destructive
+operations for:
+
+- creating a new batch record;
+- adding manually supplied drive information;
+- reviewing saved batch and drive identity information;
+- showing intake, sanitization, eligibility, and final-status fields separately;
+- moving drive intake through existing controlled status transitions;
+- moving batch intake through existing controlled status transitions;
+- reopening and continuing work from saved JSON records;
+- exporting the existing CSV report;
+- refusing to silently overwrite existing JSON or CSV output;
+- returning clear command-line errors for ordinary invalid input.
+
+Mutating commands read an existing record and write a new output record rather
+than silently replacing the input file.
+
+Intake completion represents completion of inventory/intake work only. It does
+not change a drive's sanitization status, verification result, or final
+disposition.
+
+The Phase 3 CLI does not discover physical devices and does not perform any
+sanitization operation.
 
 ## Batch Fields
 
@@ -175,9 +205,9 @@ Runtime/customer storage locations must remain excluded by `.gitignore`.
 Portfolio examples should use obviously synthetic organizations, serial
 numbers, asset tags, and device identifiers.
 
-## Acceptance Criteria
+## Records Foundation Acceptance Criteria
 
-Job 1 is acceptable only when:
+The records foundation is acceptable only when:
 
 1. Synthetic batches and drive records can be created.
 2. Records can be saved to JSON.
@@ -195,7 +225,7 @@ Job 1 is acceptable only when:
 14. Automated tests pass.
 15. Actual generated files/diffs are reviewed before promotion.
 
-## Explicitly Out of Scope for Job 1
+## Explicitly Out of Scope for Current Non-Destructive Version 1 Work
 
 - `/dev` enumeration
 - `lsblk` integration
