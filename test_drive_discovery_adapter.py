@@ -8,13 +8,14 @@ from unittest.mock import call, patch
 from drive_discovery import DiscoveryError
 from drive_discovery_adapter import (
     DiscoveryCollectionError, DiscoverySnapshot, FINDMNT_ROOT_COMMAND,
-    FINDMNT_REAL_COMMAND, LSBLK_COMMAND, SWAPON_COMMAND, SAFE_COMMAND_ENV,
+    FINDMNT_REAL_COMMAND, FSTAB_COMMAND, LSBLK_COMMAND, SWAPON_COMMAND, SAFE_COMMAND_ENV,
     collect_current_drive_discovery,
 )
 
 LSBLK_BYTES = b'{"blockdevices":[{"name":"syn-root","path":"/dev/syn-root","type":"disk","size":4096,"serial":"ID","children":[{"name":"syn-root1","path":"/dev/syn-root1","type":"part"},{"name":"boot","path":"/dev/boot","type":"part"},{"name":"swap","path":"/dev/swap","type":"part"}]}]}'
 FINDMNT_BYTES = b'{"filesystems":[{"target":"/","source":"/dev/syn-root1"}]}'
 REAL_BYTES = b'{"filesystems":[{"target":"/","source":"/dev/syn-root1","fstype":"ext4"}]}'
+FSTAB_BYTES = b'{"filesystems":[]}'
 
 
 def result(stdout=b"", stderr=b"", returncode=0):
@@ -27,15 +28,15 @@ def real(entries):
 
 class DriveDiscoveryAdapterTests(unittest.TestCase):
     def successful_mock(self, lsblk=LSBLK_BYTES, root=FINDMNT_BYTES,
-                        all_real=REAL_BYTES, swap=b""):
+                        all_real=REAL_BYTES, swap=b"", fstab=FSTAB_BYTES):
         return patch("drive_discovery_adapter.subprocess.run", side_effect=[
-            result(lsblk), result(root), result(all_real), result(swap),
+            result(lsblk), result(root), result(all_real), result(swap), result(fstab),
         ])
 
     def test_commands_and_subprocess_boundary_are_fixed(self):
         self.assertEqual(LSBLK_COMMAND, (
             "lsblk", "--json", "--bytes", "--output",
-            "NAME,KNAME,PATH,TYPE,SIZE,MODEL,SERIAL,TRAN,ROTA,RM,RO,WWN,PKNAME,FSTYPE,MOUNTPOINTS",
+            "NAME,KNAME,PATH,TYPE,SIZE,MODEL,SERIAL,TRAN,ROTA,RM,RO,WWN,PKNAME,FSTYPE,MOUNTPOINTS,UUID,PARTUUID,LABEL",
         ))
         self.assertEqual(FINDMNT_ROOT_COMMAND, (
             "findmnt", "--json", "--target", "/", "--output", "TARGET,SOURCE",
@@ -47,6 +48,10 @@ class DriveDiscoveryAdapterTests(unittest.TestCase):
         self.assertEqual(SWAPON_COMMAND, (
             "swapon", "--show=NAME,TYPE", "--raw", "--noheadings",
         ))
+        self.assertEqual(FSTAB_COMMAND, (
+            "findmnt", "--fstab", "--json", "--list", "--output",
+            "TARGET,SOURCE,FSTYPE",
+        ))
         with self.successful_mock() as run:
             collect_current_drive_discovery()
         common = dict(shell=False, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -55,7 +60,7 @@ class DriveDiscoveryAdapterTests(unittest.TestCase):
         self.assertEqual(run.call_args_list, [
             call(command, **common) for command in (
                 LSBLK_COMMAND, FINDMNT_ROOT_COMMAND, FINDMNT_REAL_COMMAND,
-                SWAPON_COMMAND,
+                SWAPON_COMMAND, FSTAB_COMMAND,
             )
         ])
         self.assertEqual(dict(SAFE_COMMAND_ENV), {
@@ -72,6 +77,7 @@ class DriveDiscoveryAdapterTests(unittest.TestCase):
                           snapshot.captured_findmnt_real_json,
                           snapshot.captured_swapon_output),
                          (LSBLK_BYTES, FINDMNT_BYTES, REAL_BYTES, b""))
+        self.assertEqual(snapshot.captured_findmnt_fstab_json, FSTAB_BYTES)
         self.assertEqual(snapshot.protected_sources, ("/dev/syn-root1",))
         self.assertIsInstance(snapshot.drives, tuple)
         self.assertTrue(snapshot.drives[0].system)
@@ -88,9 +94,9 @@ class DriveDiscoveryAdapterTests(unittest.TestCase):
         self.assertEqual(snapshot.protected_sources, (source,))
 
     def test_nonzero_commands_fail_closed(self):
-        for index in range(4):
+        for index in range(5):
             effects = [result(LSBLK_BYTES), result(FINDMNT_BYTES),
-                       result(REAL_BYTES), result()]
+                       result(REAL_BYTES), result(), result(FSTAB_BYTES)]
             effects[index] = result(returncode=7)
             with self.subTest(index=index), patch(
                     "drive_discovery_adapter.subprocess.run", side_effect=effects), \
@@ -98,9 +104,9 @@ class DriveDiscoveryAdapterTests(unittest.TestCase):
                 collect_current_drive_discovery()
 
     def test_each_command_timeout_fails_closed(self):
-        for index in range(4):
+        for index in range(5):
             effects = [result(LSBLK_BYTES), result(FINDMNT_BYTES),
-                       result(REAL_BYTES), result()]
+                       result(REAL_BYTES), result(), result(FSTAB_BYTES)]
             effects[index] = subprocess.TimeoutExpired(("synthetic",), 5)
             with self.subTest(index=index), patch(
                     "drive_discovery_adapter.subprocess.run", side_effect=effects), \
@@ -113,10 +119,10 @@ class DriveDiscoveryAdapterTests(unittest.TestCase):
             collect_current_drive_discovery()
 
     def test_oversized_stdout_and_stderr_fail_closed_for_both_commands(self):
-        for index in range(4):
+        for index in range(5):
             for stream in ("stdout", "stderr"):
                 effects = [result(LSBLK_BYTES), result(FINDMNT_BYTES),
-                           result(REAL_BYTES), result()]
+                           result(REAL_BYTES), result(), result(FSTAB_BYTES)]
                 effects[index] = result(b"xx") if stream == "stdout" else result(b"", b"xx")
                 kwargs = {"max_stdout_bytes": 1} if stream == "stdout" else {"max_stderr_bytes": 1}
                 with self.subTest(index=index, stream=stream), patch(
@@ -320,9 +326,9 @@ class DriveDiscoveryAdapterTests(unittest.TestCase):
             collect_current_drive_discovery()
 
     def test_nonbyte_results_fail_closed_for_each_command(self):
-        for index in range(4):
+        for index in range(5):
             effects = [result(LSBLK_BYTES), result(FINDMNT_BYTES),
-                       result(REAL_BYTES), result()]
+                       result(REAL_BYTES), result(), result(FSTAB_BYTES)]
             effects[index] = result("text")
             with self.subTest(index=index), patch(
                     "drive_discovery_adapter.subprocess.run", side_effect=effects), \
@@ -334,6 +340,211 @@ class DriveDiscoveryAdapterTests(unittest.TestCase):
             snapshot = collect_current_drive_discovery()
         self.assertEqual(snapshot.captured_swapon_output, b"")
         self.assertEqual(snapshot.protected_sources, ("/dev/syn-root1",))
+
+
+    def test_configured_identity_forms_protect_unmounted_parent(self):
+        forms = (
+            "UUID=id-u",
+            "PARTUUID=id-p",
+            "LABEL=id-l",
+            "/dev/disk/by-uuid/id-u",
+            "/dev/disk/by-partuuid/id-p",
+            "/dev/disk/by-label/id-l",
+            "/dev/configured",
+        )
+        for source in forms:
+            lsblk = json.dumps({
+                "blockdevices": [
+                    {
+                        "name": "rootdisk",
+                        "path": "/dev/rootdisk",
+                        "type": "disk",
+                        "size": 4096,
+                        "serial": "SYN-ROOT",
+                        "children": [
+                            {
+                                "name": "rootpart",
+                                "path": "/dev/syn-root1",
+                                "type": "part",
+                            }
+                        ],
+                    },
+                    {
+                        "name": "configureddisk",
+                        "path": "/dev/configureddisk",
+                        "type": "disk",
+                        "size": 8192,
+                        "serial": "SYN-CONFIGURED",
+                        "children": [
+                            {
+                                "name": "configured",
+                                "path": "/dev/configured",
+                                "type": "part",
+                                "uuid": "id-u",
+                                "partuuid": "id-p",
+                                "label": "id-l",
+                            }
+                        ],
+                    },
+                ]
+            }).encode()
+
+            configured = real([
+                {
+                    "target": "/boot",
+                    "source": source,
+                    "fstype": "ext4",
+                }
+            ])
+
+            with self.subTest(source=source), self.successful_mock(
+                lsblk=lsblk,
+                fstab=configured,
+            ):
+                snapshot = collect_current_drive_discovery()
+
+            drives = {
+                drive.path: drive
+                for drive in snapshot.drives
+            }
+
+            self.assertEqual(
+                snapshot.protected_sources,
+                ("/dev/syn-root1", "/dev/configured"),
+            )
+            self.assertTrue(drives["/dev/rootdisk"].system)
+            self.assertTrue(drives["/dev/configureddisk"].system)
+
+
+    def test_configured_var_and_component_descendant_are_critical(self):
+        for target in ("/var", "/var/lib/data"):
+            configured = real([{"target": target, "source": "/dev/boot", "fstype": "ext4"}])
+            with self.subTest(target=target), self.successful_mock(fstab=configured):
+                self.assertIn("/dev/boot", collect_current_drive_discovery().protected_sources)
+
+    def test_configured_identifier_zero_duplicate_and_unsupported_fail_closed(self):
+        duplicate = json.dumps({"blockdevices": [
+            {"name": "disk", "path": "/dev/disk", "type": "disk", "serial": "ID",
+             "children": [{"name": "root", "path": "/dev/syn-root1", "type": "part"},
+                          {"name": "a", "path": "/dev/a", "type": "part", "uuid": "dup"},
+                          {"name": "b", "path": "/dev/b", "type": "part", "uuid": "dup"}]}]}).encode()
+        cases = ((LSBLK_BYTES, "UUID=missing"), (duplicate, "UUID=dup"),
+                 (LSBLK_BYTES, "disk-specification"))
+        for lsblk, source in cases:
+            configured = real([{"target": "/boot", "source": source, "fstype": "ext4"}])
+            with self.subTest(source=source), self.successful_mock(lsblk=lsblk, fstab=configured), \
+                    self.assertRaises(DiscoveryCollectionError):
+                collect_current_drive_discovery()
+
+    def test_ordinary_and_network_configured_entries_do_not_protect(self):
+        entries = [{"target": target, "source": "/dev/boot", "fstype": "ext4"}
+                   for target in ("/home", "/mnt", "/media", "/run/media/x", "/srv", "/opt")]
+        entries += [{"target": "/home", "source": "server:/share", "fstype": "nfs"},
+                    {"target": "/mnt", "source": "//server/share", "fstype": "cifs"}]
+        with self.successful_mock(fstab=real(entries)):
+            self.assertEqual(collect_current_drive_discovery().protected_sources,
+                             ("/dev/syn-root1",))
+
+    def test_configured_file_swap_is_evidence_only(self):
+        configured = real([{"target": "none", "source": "/swap.img", "fstype": "swap"}])
+        with self.successful_mock(fstab=configured):
+            snapshot = collect_current_drive_discovery()
+        self.assertEqual(snapshot.captured_findmnt_fstab_json, configured)
+        self.assertEqual(snapshot.protected_sources, ("/dev/syn-root1",))
+
+    def test_inactive_configured_swap_identity_forms_are_protected(self):
+        lsblk = json.dumps({
+            "blockdevices": [
+                {
+                    "name": "rootdisk",
+                    "path": "/dev/rootdisk",
+                    "type": "disk",
+                    "size": 4096,
+                    "serial": "SYN-ROOT",
+                    "children": [
+                        {
+                            "name": "rootpart",
+                            "path": "/dev/syn-root1",
+                            "type": "part",
+                        }
+                    ],
+                },
+                {
+                    "name": "swapdisk",
+                    "path": "/dev/swapdisk",
+                    "type": "disk",
+                    "size": 8192,
+                    "serial": "SYN-SWAP",
+                    "children": [
+                        {
+                            "name": "swap",
+                            "path": "/dev/swap",
+                            "type": "part",
+                            "uuid": "su",
+                            "partuuid": "sp",
+                            "label": "sl",
+                        }
+                    ],
+                },
+            ]
+        }).encode()
+
+        for source in (
+            "/dev/swap",
+            "UUID=su",
+            "PARTUUID=sp",
+            "LABEL=sl",
+            "/dev/disk/by-uuid/su",
+            "/dev/disk/by-partuuid/sp",
+            "/dev/disk/by-label/sl",
+        ):
+            configured = real([
+                {
+                    "target": "none",
+                    "source": source,
+                    "fstype": "swap",
+                }
+            ])
+
+            with self.subTest(source=source), self.successful_mock(
+                lsblk=lsblk,
+                fstab=configured,
+            ):
+                snapshot = collect_current_drive_discovery()
+
+            drives = {
+                drive.path: drive
+                for drive in snapshot.drives
+            }
+
+            self.assertIn(
+                "/dev/swap",
+                snapshot.protected_sources,
+            )
+            self.assertTrue(drives["/dev/rootdisk"].system)
+            self.assertTrue(drives["/dev/swapdisk"].system)
+
+
+    def test_malformed_fstab_json_and_relevant_entries_fail_closed(self):
+        documents = (b"{", b"[]", b"{}", b'{"filesystems":{}}',
+                     real([42]), real([{"target": "/boot", "source": 3, "fstype": "ext4"}]),
+                     real([{"target": "/boot", "source": "/dev/boot", "fstype": None}]))
+        for document in documents:
+            with self.subTest(document=document), self.successful_mock(fstab=document), \
+                    self.assertRaises(DiscoveryCollectionError):
+                collect_current_drive_discovery()
+
+    def test_configured_dedup_and_order_are_deterministic(self):
+        configured = real([
+            {"target": "/var", "source": "/dev/swap", "fstype": "ext4"},
+            {"target": "/boot", "source": "/dev/boot", "fstype": "ext4"},
+            {"target": "/etc", "source": "/dev/boot", "fstype": "ext4"},
+            {"target": "/usr", "source": "/dev/syn-root1", "fstype": "ext4"},
+        ])
+        with self.successful_mock(fstab=configured):
+            snapshot = collect_current_drive_discovery()
+        self.assertEqual(snapshot.protected_sources,
+                         ("/dev/syn-root1", "/dev/boot", "/dev/swap"))
 
 
 if __name__ == "__main__":

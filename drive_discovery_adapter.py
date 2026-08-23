@@ -10,7 +10,7 @@ from drive_discovery import PhysicalDrive, parse_lsblk_json
 
 LSBLK_COMMAND = (
     "lsblk", "--json", "--bytes", "--output",
-    "NAME,KNAME,PATH,TYPE,SIZE,MODEL,SERIAL,TRAN,ROTA,RM,RO,WWN,PKNAME,FSTYPE,MOUNTPOINTS",
+    "NAME,KNAME,PATH,TYPE,SIZE,MODEL,SERIAL,TRAN,ROTA,RM,RO,WWN,PKNAME,FSTYPE,MOUNTPOINTS,UUID,PARTUUID,LABEL",
 )
 FINDMNT_ROOT_COMMAND = (
     "findmnt", "--json", "--target", "/", "--output", "TARGET,SOURCE",
@@ -21,6 +21,10 @@ FINDMNT_REAL_COMMAND = (
 )
 SWAPON_COMMAND = (
     "swapon", "--show=NAME,TYPE", "--raw", "--noheadings",
+)
+FSTAB_COMMAND = (
+    "findmnt", "--fstab", "--json", "--list", "--output",
+    "TARGET,SOURCE,FSTYPE",
 )
 SAFE_COMMAND_ENV = MappingProxyType({
     "PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C", "LANG": "C",
@@ -40,6 +44,7 @@ class DiscoverySnapshot:
     captured_findmnt_root_json: bytes
     captured_findmnt_real_json: bytes
     captured_swapon_output: bytes
+    captured_findmnt_fstab_json: bytes
 
 def _positive_number(value: object, name: str) -> Real:
     if (isinstance(value, bool) or not isinstance(value, Real)
@@ -139,6 +144,89 @@ def _parse_swapon(data: bytes) -> tuple[str, ...]:
             partitions.append(name)
     return tuple(partitions)
 
+_CRITICAL_FAMILIES = ("/", "/boot", "/usr", "/var", "/etc", "/bin",
+                      "/sbin", "/lib", "/lib64")
+_NETWORK_FSTYPES = frozenset(("cifs", "smb3", "nfs", "nfs4", "sshfs", "9p",
+                              "ceph", "glusterfs", "afs"))
+
+def _critical_target(target: str) -> bool:
+    return any(target == family or (family != "/" and
+               target.startswith(family + "/")) for family in _CRITICAL_FAMILIES)
+
+def _lsblk_identifier_index(data: bytes) -> dict[str, dict[str, list[str]]]:
+    devices = _json_object(data, "lsblk").get("blockdevices")
+    if not isinstance(devices, list):
+        raise DiscoveryCollectionError("lsblk blockdevices must be an array")
+    index = {key: {} for key in ("uuid", "partuuid", "label")}
+    def visit(entry: object) -> None:
+        if not isinstance(entry, dict):
+            raise DiscoveryCollectionError("lsblk device entry is invalid")
+        path = entry.get("path")
+        for key in index:
+            value = entry.get(key)
+            if value is not None:
+                if not isinstance(value, str) or not value:
+                    raise DiscoveryCollectionError(f"lsblk {key} is invalid")
+                if not isinstance(path, str) or not path:
+                    raise DiscoveryCollectionError("identified lsblk device has no path")
+                index[key].setdefault(value, []).append(path)
+        children = entry.get("children", [])
+        if not isinstance(children, list):
+            raise DiscoveryCollectionError("lsblk children must be an array")
+        for child in children:
+            visit(child)
+    for device in devices:
+        visit(device)
+    return index
+
+def _resolve_configured_source(source: str,
+        index: dict[str, dict[str, list[str]]]) -> str:
+    forms = (("UUID=", "uuid"), ("PARTUUID=", "partuuid"),
+             ("LABEL=", "label"), ("/dev/disk/by-uuid/", "uuid"),
+             ("/dev/disk/by-partuuid/", "partuuid"),
+             ("/dev/disk/by-label/", "label"))
+    for prefix, key in forms:
+        if source.startswith(prefix):
+            identifier = source[len(prefix):]
+            if not identifier:
+                raise DiscoveryCollectionError("configured identifier is empty")
+            matches = index[key].get(identifier, [])
+            if len(matches) != 1:
+                raise DiscoveryCollectionError(
+                    f"configured {key} source must match exactly one device")
+            return matches[0]
+    if source.startswith("/dev/"):
+        return source
+    raise DiscoveryCollectionError("unsupported configured local block source")
+
+def _parse_fstab_sources(data: bytes, lsblk: bytes) -> tuple[str, ...]:
+    filesystems = _json_object(data, "findmnt --fstab").get("filesystems")
+    if not isinstance(filesystems, list):
+        raise DiscoveryCollectionError("findmnt --fstab filesystems must be an array")
+    index = None
+    protected = []
+    for entry in filesystems:
+        if not isinstance(entry, dict):
+            raise DiscoveryCollectionError("findmnt --fstab entry is invalid")
+        target = entry.get("target")
+        if not isinstance(target, str) or not target.strip():
+            raise DiscoveryCollectionError("findmnt --fstab target is invalid")
+        source, fstype = entry.get("source"), entry.get("fstype")
+        relevant = _critical_target(target) or fstype == "swap"
+        if not relevant:
+            continue
+        if (not isinstance(source, str) or not source.strip() or
+                not isinstance(fstype, str) or not fstype.strip()):
+            raise DiscoveryCollectionError("relevant findmnt --fstab entry is invalid")
+        if fstype.lower() in _NETWORK_FSTYPES:
+            continue
+        if fstype == "swap" and source.startswith("/") and not source.startswith("/dev/"):
+            continue
+        if index is None:
+            index = _lsblk_identifier_index(lsblk)
+        protected.append(_resolve_configured_source(source, index))
+    return tuple(protected)
+
 def collect_current_drive_discovery(*, timeout_seconds: Real = DEFAULT_TIMEOUT_SECONDS,
     max_stdout_bytes: int = MAX_STDOUT_BYTES,
     max_stderr_bytes: int = MAX_STDERR_BYTES) -> DiscoverySnapshot:
@@ -150,14 +238,18 @@ def collect_current_drive_discovery(*, timeout_seconds: Real = DEFAULT_TIMEOUT_S
     root_data = _run_fixed_command(FINDMNT_ROOT_COMMAND, **kwargs)
     real_data = _run_fixed_command(FINDMNT_REAL_COMMAND, **kwargs)
     swap_data = _run_fixed_command(SWAPON_COMMAND, **kwargs)
+    fstab_data = _run_fixed_command(FSTAB_COMMAND, **kwargs)
     root = _parse_root_source(root_data)
     critical = _parse_real_sources(real_data, root)
     swaps = _parse_swapon(swap_data)
-    protected = (root,) + tuple(sorted(set(critical) - {root})) + tuple(sorted(set(swaps) - {root} - set(critical)))
+    configured = _parse_fstab_sources(fstab_data, lsblk)
+    live = (root,) + tuple(sorted(set(critical) - {root})) + tuple(sorted(set(swaps) - {root} - set(critical)))
+    protected = live + tuple(sorted(set(configured) - set(live)))
     drives = parse_lsblk_json(lsblk, protected_sources=protected)
-    return DiscoverySnapshot(lsblk, protected, drives, root_data, real_data, swap_data)
+    return DiscoverySnapshot(lsblk, protected, drives, root_data, real_data, swap_data, fstab_data)
 
 __all__ = ["DiscoveryCollectionError", "DiscoverySnapshot", "LSBLK_COMMAND",
- "FINDMNT_ROOT_COMMAND", "FINDMNT_REAL_COMMAND", "SWAPON_COMMAND", "SAFE_COMMAND_ENV",
+ "FINDMNT_ROOT_COMMAND", "FINDMNT_REAL_COMMAND", "SWAPON_COMMAND", "FSTAB_COMMAND",
+ "SAFE_COMMAND_ENV",
  "DEFAULT_TIMEOUT_SECONDS", "MAX_STDOUT_BYTES", "MAX_STDERR_BYTES",
  "collect_current_drive_discovery"]
