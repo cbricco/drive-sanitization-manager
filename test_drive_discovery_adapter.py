@@ -1,7 +1,10 @@
 import inspect
 import json
+import os
 import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 from dataclasses import fields
 from unittest.mock import call, patch
 
@@ -9,7 +12,8 @@ from drive_discovery import DiscoveryError
 from drive_discovery_adapter import (
     DiscoveryCollectionError, DiscoverySnapshot, FINDMNT_ROOT_COMMAND,
     FINDMNT_REAL_COMMAND, FSTAB_COMMAND, LSBLK_COMMAND, SWAPON_COMMAND, SAFE_COMMAND_ENV,
-    collect_current_drive_discovery,
+    collect_current_drive_discovery, _check_crypttab, _check_lvm_backup,
+    _check_mdadm, _check_resume, _check_special_topology, _check_systemd_units,
 )
 
 LSBLK_BYTES = b'{"blockdevices":[{"name":"syn-root","path":"/dev/syn-root","type":"disk","size":4096,"serial":"ID","children":[{"name":"syn-root1","path":"/dev/syn-root1","type":"part"},{"name":"boot","path":"/dev/boot","type":"part"},{"name":"swap","path":"/dev/swap","type":"part"}]}]}'
@@ -545,6 +549,182 @@ class DriveDiscoveryAdapterTests(unittest.TestCase):
             snapshot = collect_current_drive_discovery()
         self.assertEqual(snapshot.protected_sources,
                          ("/dev/syn-root1", "/dev/boot", "/dev/swap"))
+
+
+    def test_coverage_crypttab_blank_active_and_malformed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary, "crypttab")
+            path.write_text("  # comment\n\n")
+            _check_crypttab(str(path))
+            for content in ("vault /dev/synthetic none luks\n", "only-one-field\n"):
+                path.write_text(content)
+                with self.subTest(content=content), self.assertRaises(DiscoveryCollectionError):
+                    _check_crypttab(str(path))
+
+    def test_coverage_resume_absent_disabled_active_and_malformed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cmdline = Path(temporary, "cmdline")
+            resume = Path(temporary, "resume")
+            cmdline.write_text("quiet synthetic=1\n")
+            _check_resume(str(cmdline), str(resume))
+            cmdline.write_text("quiet resume=none\n")
+            resume.write_text("RESUME=none\n")
+            _check_resume(str(cmdline), str(resume))
+            for kernel, config in (("resume=/dev/synthetic", ""),
+                                   ("quiet", "RESUME=/dev/synthetic"),
+                                   ("quiet", "RESUME")):
+                cmdline.write_text(kernel)
+                resume.write_text(config)
+                with self.subTest(kernel=kernel, config=config), self.assertRaises(DiscoveryCollectionError):
+                    _check_resume(str(cmdline), str(resume))
+
+    def test_coverage_systemd_snap_native_swap_and_fake(self):
+        snap = """[Mount]\nWhat=/var/lib/snapd/snaps/sample_7.snap\nWhere=/snap/sample/7\nType=squashfs\n"""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            unit = root / "snap-sample-7.mount"
+            unit.write_text(snap)
+            _check_systemd_units(str(root))
+            unit.rename(root / "snap-fake-7.mount")
+            with self.assertRaises(DiscoveryCollectionError):
+                _check_systemd_units(str(root))
+        for name in ("native.mount", "native.swap"):
+            with tempfile.TemporaryDirectory() as temporary:
+                Path(temporary, name).write_text("[Mount]\nWhat=/dev/synthetic\nWhere=/mnt/x\n")
+                with self.subTest(name=name), self.assertRaises(DiscoveryCollectionError):
+                    _check_systemd_units(temporary)
+
+    def test_coverage_systemd_symlinks_masks_and_bounds(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            os.symlink("/dev/null", root / "masked.mount")
+            _check_systemd_units(str(root))
+            os.symlink("/dev/synthetic", root / "suspicious.swap")
+            with self.assertRaises(DiscoveryCollectionError):
+                _check_systemd_units(str(root))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            Path(root, "a").write_text("")
+            Path(root, "b").write_text("")
+            with self.assertRaises(DiscoveryCollectionError):
+                _check_systemd_units(str(root), max_entries=1)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            Path(root, "native.mount").write_text("x" * 3)
+            with self.assertRaises(DiscoveryCollectionError):
+                _check_systemd_units(str(root), max_unit_bytes=2)
+            with self.assertRaises(DiscoveryCollectionError):
+                _check_systemd_units(str(root), max_total_bytes=2)
+
+    def test_coverage_systemd_malformed_and_unreadable_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary, "snap-sample-7.mount")
+            path.write_bytes(b"\xff")
+            with self.assertRaises(DiscoveryCollectionError):
+                _check_systemd_units(temporary)
+        with patch("drive_discovery_adapter.os.scandir", side_effect=PermissionError()), \
+                self.assertRaises(DiscoveryCollectionError):
+            _check_systemd_units("/synthetic-fixed-root")
+
+    def test_coverage_special_topology_layers_fail_closed(self):
+        for kind in ("crypt", "lvm", "dm", "md", "md127", "raid0", "raid10"):
+            document = json.dumps({"blockdevices": [{"type": "disk", "children": [
+                {"type": kind}]}]}).encode()
+            with self.subTest(kind=kind), self.assertRaises(DiscoveryCollectionError):
+                _check_special_topology(document)
+        _check_special_topology(b'{"blockdevices":[{"type":"disk","children":[{"type":"part"}]}]}')
+
+    def test_coverage_mdadm_array_and_irrelevant_configuration(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary, "mdadm.conf")
+            path.write_text("# ARRAY ignored\nDEVICE partitions\n")
+            _check_mdadm((str(path), str(Path(temporary, "absent"))))
+            path.write_text("ARRAY /dev/md/synthetic metadata=1.2\n")
+            with self.assertRaises(DiscoveryCollectionError):
+                _check_mdadm((str(path),))
+            path.write_text("ARRAY\n")
+            with self.assertRaises(DiscoveryCollectionError):
+                _check_mdadm((str(path),))
+
+    def test_coverage_lvm_backup_absent_empty_and_metadata(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            absent = str(Path(temporary, "absent"))
+            _check_lvm_backup(absent)
+            backup = Path(temporary, "backup")
+            backup.mkdir()
+            _check_lvm_backup(str(backup))
+            Path(backup, "synthetic-vg").write_text("metadata is intentionally not read")
+            with self.assertRaises(DiscoveryCollectionError):
+                _check_lvm_backup(str(backup))
+
+    def test_snap_exact_squashfs_type_is_accepted(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            Path(temporary, "snap-sample-7.mount").write_text(
+                "[Mount]\nWhat=/var/lib/snapd/snaps/sample_7.snap\n"
+                "Where=/snap/sample/7\nType=squashfs\n")
+            _check_systemd_units(temporary)
+
+    def test_snap_missing_type_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            Path(temporary, "snap-sample-7.mount").write_text(
+                "[Mount]\nWhat=/var/lib/snapd/snaps/sample_7.snap\n"
+                "Where=/snap/sample/7\n")
+            with self.assertRaises(DiscoveryCollectionError):
+                _check_systemd_units(temporary)
+
+    def test_snap_non_squashfs_type_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            Path(temporary, "snap-sample-7.mount").write_text(
+                "[Mount]\nWhat=/var/lib/snapd/snaps/sample_7.snap\n"
+                "Where=/snap/sample/7\nType=ext4\n")
+            with self.assertRaises(DiscoveryCollectionError):
+                _check_systemd_units(temporary)
+
+    def test_snap_duplicate_type_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            Path(temporary, "snap-sample-7.mount").write_text(
+                "[Mount]\nWhat=/var/lib/snapd/snaps/sample_7.snap\n"
+                "Where=/snap/sample/7\nType=squashfs\nType=squashfs\n")
+            with self.assertRaises(DiscoveryCollectionError):
+                _check_systemd_units(temporary)
+
+    def test_empty_lvm_backup_directory_is_accepted(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            backup = Path(temporary, "backup")
+            backup.mkdir()
+            _check_lvm_backup(str(backup))
+
+    def test_lvm_regular_metadata_file_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            backup = Path(temporary, "backup")
+            backup.mkdir()
+            Path(backup, "synthetic-vg").write_text("metadata is intentionally not read")
+            with self.assertRaises(DiscoveryCollectionError):
+                _check_lvm_backup(str(backup))
+
+    def test_lvm_subdirectory_entry_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            backup = Path(temporary, "backup")
+            backup.mkdir()
+            Path(backup, "nested").mkdir()
+            with self.assertRaises(DiscoveryCollectionError):
+                _check_lvm_backup(str(backup))
+
+    def test_lvm_symlink_entry_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            backup = Path(temporary, "backup")
+            backup.mkdir()
+            os.symlink("missing-target", backup / "synthetic-link")
+            with self.assertRaises(DiscoveryCollectionError):
+                _check_lvm_backup(str(backup))
+
+    def test_coverage_paths_are_not_publicly_substitutable(self):
+        parameters = inspect.signature(collect_current_drive_discovery).parameters
+        for name in ("crypttab_path", "cmdline_path", "resume_path", "systemd_path",
+                     "mdadm_path", "lvm_backup_path"):
+            self.assertNotIn(name, parameters)
+            with self.assertRaises(TypeError):
+                collect_current_drive_discovery(**{name: "/synthetic"})
 
 
 if __name__ == "__main__":
