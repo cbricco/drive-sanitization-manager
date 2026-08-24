@@ -32,7 +32,7 @@ from drive_sanitization_manager import (
 )
 
 
-POLICY_VERSION = "phase5-auth-v2"
+POLICY_VERSION = "phase5-auth-v3"
 SCHEMA_VERSION = 1
 
 EVIDENCE_ORIGIN = "phase4-current-collector-v1"
@@ -686,22 +686,6 @@ def _make_decision(
             )
         )
 
-    payload = {
-        "policy_version": POLICY_VERSION,
-        "schema_version": SCHEMA_VERSION,
-        "evidence_origin": EVIDENCE_ORIGIN,
-        "request_hash": req_hash,
-        "record_snapshot_hash": record_hash,
-        "discovery_snapshot_hash": snapshot_hash,
-        "target_binding_hash": binding_hash,
-        "status": status,
-        "reason_codes": reason_codes,
-        "evaluated_at_utc": _iso_utc(evaluated_at),
-        "discovery_captured_at_utc":
-            _iso_utc(captured_at),
-        "prerequisite_valid_until_utc": valid_until,
-    }
-
     raw_request_id = getattr(
         request,
         "request_id",
@@ -713,6 +697,23 @@ def _make_decision(
         if isinstance(raw_request_id, str)
         else ""
     )
+
+    payload = {
+        "policy_version": POLICY_VERSION,
+        "schema_version": SCHEMA_VERSION,
+        "evidence_origin": EVIDENCE_ORIGIN,
+        "request_id": request_id,
+        "request_hash": req_hash,
+        "record_snapshot_hash": record_hash,
+        "discovery_snapshot_hash": snapshot_hash,
+        "target_binding_hash": binding_hash,
+        "status": status,
+        "reason_codes": reason_codes,
+        "evaluated_at_utc": _iso_utc(evaluated_at),
+        "discovery_captured_at_utc":
+            _iso_utc(captured_at),
+        "prerequisite_valid_until_utc": valid_until,
+    }
 
     return AuthorizationDecision(
         decision_id=_canonical_hash(payload),
@@ -1122,6 +1123,312 @@ def evaluate_current_authorization_prerequisites(
     )
 
 
+def _canonical_hash_value(value: Any) -> bool:
+    """Return whether value has the canonical SHA-256 representation."""
+
+    if (
+        not isinstance(value, str)
+        or len(value) != 71
+        or not value.startswith("sha256:")
+    ):
+        return False
+
+    return all(
+        character in "0123456789abcdef"
+        for character in value[7:]
+    )
+
+
+def _positive_binding_integrity_valid(
+    binding: TargetIdentityBinding,
+) -> bool:
+    """Validate all strict target facts required by a positive decision."""
+
+    if not isinstance(binding, TargetIdentityBinding):
+        return False
+
+    if not _path_is_valid(binding.path):
+        return False
+
+    serial = _candidate_identity(binding.serial)
+    wwn = _candidate_identity(binding.wwn)
+
+    if (
+        binding.serial is not None
+        and serial != binding.serial
+    ):
+        return False
+
+    if (
+        binding.wwn is not None
+        and wwn != binding.wwn
+    ):
+        return False
+
+    if serial is None and wwn is None:
+        return False
+
+    if (
+        type(binding.size_bytes) is not int
+        or binding.size_bytes <= 0
+    ):
+        return False
+
+    for optional_text in (
+        binding.model,
+        binding.transport,
+    ):
+        if optional_text is None:
+            continue
+
+        if (
+            not isinstance(optional_text, str)
+            or not optional_text.strip()
+            or optional_text != optional_text.strip()
+            or _contains_forbidden_control(optional_text)
+        ):
+            return False
+
+    safety_flags = (
+        binding.read_only,
+        binding.mounted,
+        binding.protected,
+        binding.system_protected,
+        binding.review_required,
+        binding.ambiguous,
+    )
+
+    if any(
+        type(value) is not bool
+        for value in safety_flags
+    ):
+        return False
+
+    # A positive prerequisite decision requires every safety blocker
+    # to be explicitly false. Merely being a boolean is insufficient.
+    if any(safety_flags):
+        return False
+
+    return True
+
+
+def _decision_integrity_valid_impl(
+    decision: AuthorizationDecision,
+) -> bool:
+    """Internal implementation for fail-closed decision validation."""
+
+    if not isinstance(decision, AuthorizationDecision):
+        return False
+
+    if (
+        decision.policy_version != POLICY_VERSION
+        or type(decision.schema_version) is not int
+        or decision.schema_version != SCHEMA_VERSION
+        or decision.evidence_origin != EVIDENCE_ORIGIN
+    ):
+        return False
+
+    if (
+        not isinstance(decision.request_id, str)
+        or _contains_forbidden_control(decision.request_id)
+    ):
+        return False
+
+    if not _canonical_hash_value(decision.decision_id):
+        return False
+
+    for hash_value in (
+        decision.request_hash,
+        decision.record_snapshot_hash,
+        decision.discovery_snapshot_hash,
+        decision.target_binding_hash,
+    ):
+        if (
+            hash_value is not None
+            and not _canonical_hash_value(hash_value)
+        ):
+            return False
+
+    if (
+        not isinstance(decision.status, str)
+        or decision.status not in _STATUS_PRECEDENCE
+    ):
+        return False
+
+    if not isinstance(decision.reason_codes, tuple):
+        return False
+
+    if any(
+        not isinstance(reason, str)
+        or reason not in _REASON_CLASS
+        for reason in decision.reason_codes
+    ):
+        return False
+
+    if (
+        len(set(decision.reason_codes))
+        != len(decision.reason_codes)
+    ):
+        return False
+
+    expected_status = _decision_status(
+        list(decision.reason_codes)
+    )
+
+    if expected_status != decision.status:
+        return False
+
+    evaluated_at = _parse_utc(
+        decision.evaluated_at_utc,
+        "evaluated_at_utc",
+    )
+
+    captured_at = _parse_utc(
+        decision.discovery_captured_at_utc,
+        "discovery_captured_at_utc",
+    )
+
+    if (
+        _iso_utc(evaluated_at)
+        != decision.evaluated_at_utc
+        or _iso_utc(captured_at)
+        != decision.discovery_captured_at_utc
+    ):
+        return False
+
+    binding = decision.target_binding
+
+    if binding is None:
+        if decision.target_binding_hash is not None:
+            return False
+    else:
+        if not isinstance(binding, TargetIdentityBinding):
+            return False
+
+        expected_binding_hash = _canonical_hash(
+            asdict(binding)
+        )
+
+        if (
+            decision.target_binding_hash
+            != expected_binding_hash
+        ):
+            return False
+
+    if decision.status == STATUS_PREREQUISITES_MET:
+        if (
+            not decision.request_id.strip()
+            or decision.request_id
+            != decision.request_id.strip()
+        ):
+            return False
+
+        if any(
+            value is None
+            for value in (
+                decision.request_hash,
+                decision.record_snapshot_hash,
+                decision.discovery_snapshot_hash,
+                decision.target_binding_hash,
+                binding,
+            )
+        ):
+            return False
+
+        if decision.reason_codes:
+            return False
+
+        if not _positive_binding_integrity_valid(binding):
+            return False
+
+        if (
+            captured_at
+            > evaluated_at
+            + timedelta(
+                seconds=MAX_FUTURE_SKEW_SECONDS
+            )
+        ):
+            return False
+
+        if (
+            evaluated_at - captured_at
+            > timedelta(
+                seconds=MAX_DISCOVERY_AGE_SECONDS
+            )
+        ):
+            return False
+
+        if decision.prerequisite_valid_until_utc is None:
+            return False
+
+        expires = _parse_utc(
+            decision.prerequisite_valid_until_utc,
+            "prerequisite_valid_until_utc",
+        )
+
+        if (
+            _iso_utc(expires)
+            != decision.prerequisite_valid_until_utc
+        ):
+            return False
+
+        if (
+            expires
+            != evaluated_at
+            + timedelta(
+                seconds=PREREQUISITE_LIFETIME_SECONDS
+            )
+        ):
+            return False
+
+    else:
+        if decision.prerequisite_valid_until_utc is not None:
+            return False
+
+    payload = {
+        "policy_version": decision.policy_version,
+        "schema_version": decision.schema_version,
+        "evidence_origin": decision.evidence_origin,
+        "request_id": decision.request_id,
+        "request_hash": decision.request_hash,
+        "record_snapshot_hash":
+            decision.record_snapshot_hash,
+        "discovery_snapshot_hash":
+            decision.discovery_snapshot_hash,
+        "target_binding_hash":
+            decision.target_binding_hash,
+        "status": decision.status,
+        "reason_codes": decision.reason_codes,
+        "evaluated_at_utc": decision.evaluated_at_utc,
+        "discovery_captured_at_utc":
+            decision.discovery_captured_at_utc,
+        "prerequisite_valid_until_utc":
+            decision.prerequisite_valid_until_utc,
+    }
+
+    return (
+        decision.decision_id
+        == _canonical_hash(payload)
+    )
+
+
+def decision_integrity_valid(
+    decision: Any,
+) -> bool:
+    """Verify deterministic decision internal consistency.
+
+    This is deliberately not a signature, provenance proof, human
+    approval, or execution authority. Any malformed input fails closed.
+    """
+
+    try:
+        return _decision_integrity_valid_impl(
+            decision
+        )
+    except Exception:
+        return False
+
+
 def decision_is_current(
     decision: AuthorizationDecision,
 ) -> bool:
@@ -1129,6 +1436,9 @@ def decision_is_current(
 
     True still does not represent human approval or execution authority.
     """
+
+    if not decision_integrity_valid(decision):
+        return False
 
     if (
         decision.status
@@ -1155,6 +1465,34 @@ def decision_is_current(
     except AuthorizationError:
         return False
 
+    try:
+        evaluated_at = _parse_utc(
+            decision.evaluated_at_utc,
+            "evaluated_at_utc",
+        )
+        captured_at = _parse_utc(
+            decision.discovery_captured_at_utc,
+            "discovery_captured_at_utc",
+        )
+    except AuthorizationError:
+        return False
+
+    # Currentness must fail closed if the local clock is more than the
+    # configured skew behind either trusted decision timestamp.
+    lower_reference = max(
+        evaluated_at,
+        captured_at,
+    )
+
+    if (
+        now
+        < lower_reference
+        - timedelta(
+            seconds=MAX_FUTURE_SKEW_SECONDS
+        )
+    ):
+        return False
+
     return now <= expires
 
 
@@ -1175,6 +1513,7 @@ __all__ = [
     "STATUS_REVIEW_REQUIRED",
     "STATUS_EVALUATION_FAILED",
     "build_authorization_request",
+    "decision_integrity_valid",
     "decision_is_current",
     "discovery_snapshot_hash",
     "evaluate_current_authorization_prerequisites",

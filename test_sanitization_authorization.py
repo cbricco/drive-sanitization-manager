@@ -1,5 +1,5 @@
 from dataclasses import FrozenInstanceError, fields, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import inspect
 import json
 import unittest
@@ -22,6 +22,7 @@ from sanitization_authorization import (
     STATUS_REFUSED,
     STATUS_REVIEW_REQUIRED,
     build_authorization_request,
+    decision_integrity_valid,
     decision_is_current,
     discovery_snapshot_hash,
     evaluate_current_authorization_prerequisites,
@@ -1468,6 +1469,506 @@ class Phase5AuthorizationR2Tests(unittest.TestCase):
             decision,
             "RECORD_INVALID",
         )
+
+    def test_decision_integrity_accepts_genuine_positive_decision(self):
+        decision = self.evaluate()
+
+        self.assertEqual(
+            decision.status,
+            STATUS_PREREQUISITES_MET,
+        )
+        self.assertTrue(
+            decision_integrity_valid(decision)
+        )
+
+    def test_decision_integrity_rejects_invented_decision_id(self):
+        decision = self.evaluate()
+
+        forged = replace(
+            decision,
+            decision_id="sha256:" + ("0" * 64),
+        )
+
+        self.assertFalse(
+            decision_integrity_valid(forged)
+        )
+        self.assertFalse(
+            decision_is_current(forged)
+        )
+
+    def test_decision_integrity_binds_request_id(self):
+        decision = self.evaluate()
+
+        tampered = replace(
+            decision,
+            request_id="REQ-TAMPERED",
+        )
+
+        self.assertFalse(
+            decision_integrity_valid(tampered)
+        )
+
+    def test_decision_integrity_rejects_status_or_reason_tampering(self):
+        decision = self.evaluate()
+
+        self.assertFalse(
+            decision_integrity_valid(
+                replace(
+                    decision,
+                    status=STATUS_REFUSED,
+                )
+            )
+        )
+
+        self.assertFalse(
+            decision_integrity_valid(
+                replace(
+                    decision,
+                    reason_codes=("TARGET_MOUNTED",),
+                )
+            )
+        )
+
+    def test_decision_integrity_binds_target_binding(self):
+        decision = self.evaluate()
+
+        tampered_binding = replace(
+            decision.target_binding,
+            path="/dev/other-synthetic",
+        )
+
+        self.assertFalse(
+            decision_integrity_valid(
+                replace(
+                    decision,
+                    target_binding=tampered_binding,
+                )
+            )
+        )
+
+    def test_decision_integrity_rejects_extended_prerequisite_lifetime(self):
+        decision = self.evaluate()
+
+        expires = datetime.fromisoformat(
+            decision.prerequisite_valid_until_utc
+            .replace("Z", "+00:00")
+        )
+
+        extended = (
+            expires
+            + timedelta(seconds=1)
+        ).isoformat().replace(
+            "+00:00",
+            "Z",
+        )
+
+        self.assertFalse(
+            decision_integrity_valid(
+                replace(
+                    decision,
+                    prerequisite_valid_until_utc=extended,
+                )
+            )
+        )
+
+    def test_decision_integrity_rejects_policy_schema_or_origin_tampering(self):
+        decision = self.evaluate()
+
+        values = (
+            replace(
+                decision,
+                policy_version="phase5-auth-v2",
+            ),
+            replace(
+                decision,
+                schema_version=999,
+            ),
+            replace(
+                decision,
+                evidence_origin="fabricated-origin",
+            ),
+        )
+
+        for value in values:
+            with self.subTest(value=value):
+                self.assertFalse(
+                    decision_integrity_valid(value)
+                )
+
+    def test_decision_integrity_and_currentness_fail_closed_on_malformed_input(self):
+        decision = self.evaluate()
+
+        malformed_values = (
+            object(),
+            replace(
+                decision,
+                decision_id=object(),
+            ),
+            replace(
+                decision,
+                request_id=object(),
+            ),
+            replace(
+                decision,
+                evaluated_at_utc=object(),
+            ),
+            replace(
+                decision,
+                status=[],
+            ),
+            replace(
+                decision,
+                reason_codes=([],),
+            ),
+            replace(
+                decision,
+                target_binding=replace(
+                    decision.target_binding,
+                    path=object(),
+                ),
+            ),
+            replace(
+                decision,
+                target_binding=replace(
+                    decision.target_binding,
+                    mounted=1,
+                ),
+            ),
+        )
+
+        for value in malformed_values:
+            with self.subTest(value=type(value).__name__):
+                self.assertFalse(
+                    decision_integrity_valid(value)
+                )
+                self.assertFalse(
+                    decision_is_current(value)
+                )
+
+    def test_decision_integrity_accepts_exact_five_second_future_skew(self):
+        record = self.record()
+        snapshot = self.snapshot()
+
+        with patch(
+            "sanitization_authorization._utc_now",
+            return_value=datetime(
+                2026, 8, 23, 9, 59, 0,
+                tzinfo=UTC,
+            ),
+        ):
+            request = build_authorization_request(
+                record,
+                request_id="SKEW-BOUNDARY-REQ",
+                operation="sanitize",
+                method_profile_id="phase5-policy-only",
+            )
+
+        with (
+            patch(
+                "sanitization_authorization."
+                "collect_current_drive_discovery",
+                return_value=snapshot,
+            ),
+            patch(
+                "sanitization_authorization._utc_now",
+                side_effect=[
+                    datetime(
+                        2026, 8, 23, 10, 0, 5,
+                        tzinfo=UTC,
+                    ),
+                    datetime(
+                        2026, 8, 23, 10, 0, 0,
+                        tzinfo=UTC,
+                    ),
+                ],
+            ),
+        ):
+            decision = (
+                evaluate_current_authorization_prerequisites(
+                    request,
+                    record,
+                )
+            )
+
+        self.assertEqual(
+            decision.status,
+            STATUS_PREREQUISITES_MET,
+        )
+        self.assertTrue(
+            decision_integrity_valid(decision)
+        )
+
+    def test_decision_currentness_allows_exact_skew_but_rejects_excessive_rollback(self):
+        decision = self.evaluate()
+
+        evaluated = datetime.fromisoformat(
+            decision.evaluated_at_utc.replace(
+                "Z",
+                "+00:00",
+            )
+        )
+
+        exact_boundary = (
+            evaluated
+            - timedelta(seconds=5)
+        )
+
+        beyond_boundary = (
+            exact_boundary
+            - timedelta(seconds=1)
+        )
+
+        with patch(
+            "sanitization_authorization._utc_now",
+            return_value=exact_boundary,
+        ):
+            self.assertTrue(
+                decision_is_current(decision)
+            )
+
+        with patch(
+            "sanitization_authorization._utc_now",
+            return_value=beyond_boundary,
+        ):
+            self.assertFalse(
+                decision_is_current(decision)
+            )
+
+    def test_genuine_nonpositive_decisions_remain_integrity_valid(self):
+        refused_record = self.record(
+            intended_action="different-action"
+        )
+
+        refused = self.evaluate(
+            record=refused_record,
+            request=self.request(
+                refused_record
+            ),
+        )
+
+        review_record = self.record(
+            sanitization_eligibility_status="review_needed"
+        )
+
+        review = self.evaluate(
+            record=review_record,
+            request=self.request(
+                review_record
+            ),
+        )
+
+        malformed_snapshot = self.snapshot([
+            self.device(
+                serial="BAD\x00SERIAL",
+                wwn="WWN-A",
+            )
+        ])
+
+        record = self.record()
+
+        failed = self.evaluate(
+            record=record,
+            request=self.request(record),
+            snapshot=malformed_snapshot,
+        )
+
+        for decision in (
+            refused,
+            review,
+            failed,
+        ):
+            with self.subTest(status=decision.status):
+                self.assertNotEqual(
+                    decision.status,
+                    STATUS_PREREQUISITES_MET,
+                )
+                self.assertTrue(
+                    decision_integrity_valid(
+                        decision
+                    )
+                )
+                self.assertFalse(
+                    decision_is_current(
+                        decision
+                    )
+                )
+
+    def test_positive_integrity_requires_complete_evidence_and_safe_binding(self):
+        decision = self.evaluate()
+
+        missing_hash = replace(
+            decision,
+            discovery_snapshot_hash=None,
+        )
+
+        unsafe_binding = replace(
+            decision.target_binding,
+            mounted=True,
+        )
+
+        unsafe = replace(
+            decision,
+            target_binding=unsafe_binding,
+        )
+
+        self.assertFalse(
+            decision_integrity_valid(
+                missing_hash
+            )
+        )
+        self.assertFalse(
+            decision_integrity_valid(
+                unsafe
+            )
+        )
+
+    def test_currentness_uses_later_of_evaluation_and_discovery_timestamp(self):
+        record = self.record()
+        snapshot = self.snapshot()
+
+        with patch(
+            "sanitization_authorization._utc_now",
+            return_value=datetime(
+                2026, 8, 23, 9, 59, 0,
+                tzinfo=UTC,
+            ),
+        ):
+            request = build_authorization_request(
+                record,
+                request_id="R3-CURRENTNESS-LATER-TIME",
+                operation="sanitize",
+                method_profile_id="phase5-policy-only",
+            )
+
+        with (
+            patch(
+                "sanitization_authorization."
+                "collect_current_drive_discovery",
+                return_value=snapshot,
+            ),
+            patch(
+                "sanitization_authorization._utc_now",
+                side_effect=[
+                    datetime(
+                        2026, 8, 23, 10, 0, 5,
+                        tzinfo=UTC,
+                    ),
+                    datetime(
+                        2026, 8, 23, 10, 0, 0,
+                        tzinfo=UTC,
+                    ),
+                ],
+            ),
+        ):
+            decision = (
+                evaluate_current_authorization_prerequisites(
+                    request,
+                    record,
+                )
+            )
+
+        with patch(
+            "sanitization_authorization._utc_now",
+            return_value=datetime(
+                2026, 8, 23, 10, 0, 0,
+                tzinfo=UTC,
+            ),
+        ):
+            self.assertTrue(
+                decision_is_current(decision)
+            )
+
+        with patch(
+            "sanitization_authorization._utc_now",
+            return_value=datetime(
+                2026, 8, 23, 9, 59, 59,
+                tzinfo=UTC,
+            ),
+        ):
+            self.assertFalse(
+                decision_is_current(decision)
+            )
+
+    def test_rehashed_positive_rejects_each_unsafe_safety_flag(self):
+        from dataclasses import asdict
+        import sanitization_authorization as auth
+
+        decision = self.evaluate()
+
+        flag_names = (
+            "read_only",
+            "mounted",
+            "protected",
+            "system_protected",
+            "review_required",
+            "ambiguous",
+        )
+
+        for flag_name in flag_names:
+            with self.subTest(flag=flag_name):
+                unsafe_binding = replace(
+                    decision.target_binding,
+                    **{flag_name: True},
+                )
+
+                unsafe_binding_hash = (
+                    auth._canonical_hash(
+                        asdict(unsafe_binding)
+                    )
+                )
+
+                tampered = replace(
+                    decision,
+                    target_binding=unsafe_binding,
+                    target_binding_hash=unsafe_binding_hash,
+                )
+
+                payload = {
+                    "policy_version":
+                        tampered.policy_version,
+                    "schema_version":
+                        tampered.schema_version,
+                    "evidence_origin":
+                        tampered.evidence_origin,
+                    "request_id":
+                        tampered.request_id,
+                    "request_hash":
+                        tampered.request_hash,
+                    "record_snapshot_hash":
+                        tampered.record_snapshot_hash,
+                    "discovery_snapshot_hash":
+                        tampered.discovery_snapshot_hash,
+                    "target_binding_hash":
+                        tampered.target_binding_hash,
+                    "status":
+                        tampered.status,
+                    "reason_codes":
+                        tampered.reason_codes,
+                    "evaluated_at_utc":
+                        tampered.evaluated_at_utc,
+                    "discovery_captured_at_utc":
+                        tampered.discovery_captured_at_utc,
+                    "prerequisite_valid_until_utc":
+                        tampered.prerequisite_valid_until_utc,
+                }
+
+                rehashed = replace(
+                    tampered,
+                    decision_id=auth._canonical_hash(
+                        payload
+                    ),
+                )
+
+                self.assertFalse(
+                    decision_integrity_valid(
+                        rehashed
+                    )
+                )
+                self.assertFalse(
+                    decision_is_current(
+                        rehashed
+                    )
+                )
 
 
 if __name__ == "__main__":
