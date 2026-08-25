@@ -495,6 +495,292 @@ def _canonical_hash(payload: Any) -> str:
 
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
+METHOD_CONSTRAINT_STATUS_SATISFIED = (
+    "method_constraints_satisfied"
+)
+METHOD_CONSTRAINT_STATUS_REVIEW_REQUIRED = (
+    "method_constraints_review_required"
+)
+METHOD_CONSTRAINT_STATUS_REFUSED = (
+    "method_constraints_refused"
+)
+METHOD_CONSTRAINT_STATUS_EVALUATION_FAILED = (
+    "method_constraints_evaluation_failed"
+)
+
+
+@dataclass(frozen=True)
+class SanitizationMethodConstraintEvaluation:
+    """Deterministic non-authorizing method-constraint result.
+
+    A satisfied result means only that the supplied target binding
+    satisfies the frozen capability metadata.  It is not human approval,
+    execution authorization, method selection, or evidence of sanitization.
+    """
+
+    method_profile_id: str
+    target_binding_hash: Optional[str]
+    status: str
+    reason_codes: tuple[str, ...]
+
+
+_METHOD_CONSTRAINT_REASON_CLASS = {
+    "METHOD_CONSTRAINT_METADATA_UNAVAILABLE":
+        METHOD_CONSTRAINT_STATUS_EVALUATION_FAILED,
+    "METHOD_CONSTRAINT_TARGET_BINDING_INVALID":
+        METHOD_CONSTRAINT_STATUS_EVALUATION_FAILED,
+    "METHOD_CONSTRAINT_STRONG_IDENTITY_REQUIRED":
+        METHOD_CONSTRAINT_STATUS_EVALUATION_FAILED,
+
+    "METHOD_CONSTRAINT_SYSTEM_TARGET":
+        METHOD_CONSTRAINT_STATUS_REFUSED,
+    "METHOD_CONSTRAINT_TARGET_PROTECTED":
+        METHOD_CONSTRAINT_STATUS_REFUSED,
+    "METHOD_CONSTRAINT_TARGET_MOUNTED":
+        METHOD_CONSTRAINT_STATUS_REFUSED,
+    "METHOD_CONSTRAINT_TARGET_READ_ONLY":
+        METHOD_CONSTRAINT_STATUS_REFUSED,
+
+    "METHOD_CONSTRAINT_TARGET_AMBIGUOUS":
+        METHOD_CONSTRAINT_STATUS_REVIEW_REQUIRED,
+    "METHOD_CONSTRAINT_TARGET_REVIEW_REQUIRED":
+        METHOD_CONSTRAINT_STATUS_REVIEW_REQUIRED,
+}
+
+
+_METHOD_CONSTRAINT_STATUS_PRECEDENCE = {
+    METHOD_CONSTRAINT_STATUS_SATISFIED: 0,
+    METHOD_CONSTRAINT_STATUS_REVIEW_REQUIRED: 1,
+    METHOD_CONSTRAINT_STATUS_REFUSED: 2,
+    METHOD_CONSTRAINT_STATUS_EVALUATION_FAILED: 3,
+}
+
+
+def _method_constraint_optional_text_valid(
+    value: Any,
+) -> bool:
+    if value is None:
+        return True
+
+    if not isinstance(value, str):
+        return False
+
+    return not any(
+        ord(character) < 32
+        or ord(character) == 127
+        for character in value
+    )
+
+
+def _method_constraint_identity_present(
+    value: Any,
+) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value.strip())
+        and not any(
+            ord(character) < 32
+            or ord(character) == 127
+            for character in value
+        )
+    )
+
+
+def _sanitization_method_constraint_target_binding_valid(
+    target_binding: Any,
+) -> bool:
+    if not isinstance(
+        target_binding,
+        TargetIdentityBinding,
+    ):
+        return False
+
+    if (
+        not isinstance(target_binding.path, str)
+        or not target_binding.path.strip()
+        or any(
+            ord(character) < 32
+            or ord(character) == 127
+            for character in target_binding.path
+        )
+    ):
+        return False
+
+    if (
+        type(target_binding.size_bytes) is not int
+        or target_binding.size_bytes <= 0
+    ):
+        return False
+
+    for value in (
+        target_binding.serial,
+        target_binding.wwn,
+        target_binding.model,
+        target_binding.transport,
+    ):
+        if not _method_constraint_optional_text_valid(
+            value
+        ):
+            return False
+
+    bool_values = (
+        target_binding.read_only,
+        target_binding.mounted,
+        target_binding.protected,
+        target_binding.system_protected,
+        target_binding.review_required,
+        target_binding.ambiguous,
+    )
+
+    return all(
+        type(value) is bool
+        for value in bool_values
+    )
+
+
+def _sanitization_method_constraint_status(
+    reason_codes: tuple[str, ...],
+) -> str:
+    if not reason_codes:
+        return METHOD_CONSTRAINT_STATUS_SATISFIED
+
+    return max(
+        (
+            _METHOD_CONSTRAINT_REASON_CLASS.get(
+                reason,
+                METHOD_CONSTRAINT_STATUS_EVALUATION_FAILED,
+            )
+            for reason in reason_codes
+        ),
+        key=_METHOD_CONSTRAINT_STATUS_PRECEDENCE.__getitem__,
+    )
+
+
+def evaluate_sanitization_method_constraints(
+    method_profile_id: Any,
+    target_binding: Any,
+) -> SanitizationMethodConstraintEvaluation:
+    """Evaluate frozen method constraints against one supplied binding.
+
+    This function performs no discovery, approval, execution, device access,
+    method auto-selection, or mutation.
+    """
+
+    reasons: list[str] = []
+
+    raw_method_profile_id = (
+        method_profile_id
+        if isinstance(method_profile_id, str)
+        else ""
+    )
+
+    metadata = (
+        get_sanitization_method_capability_metadata(
+            method_profile_id
+        )
+    )
+
+    if metadata is None:
+        reasons.append(
+            "METHOD_CONSTRAINT_METADATA_UNAVAILABLE"
+        )
+
+    binding_valid = (
+        _sanitization_method_constraint_target_binding_valid(
+            target_binding
+        )
+    )
+
+    target_binding_hash = None
+
+    if not binding_valid:
+        reasons.append(
+            "METHOD_CONSTRAINT_TARGET_BINDING_INVALID"
+        )
+    else:
+        target_binding_hash = _canonical_hash(
+            asdict(target_binding)
+        )
+
+    if metadata is not None and binding_valid:
+        strong_identity_present = (
+            _method_constraint_identity_present(
+                target_binding.serial
+            )
+            or _method_constraint_identity_present(
+                target_binding.wwn
+            )
+        )
+
+        if (
+            metadata.requires_strong_identity
+            and not strong_identity_present
+        ):
+            reasons.append(
+                "METHOD_CONSTRAINT_STRONG_IDENTITY_REQUIRED"
+            )
+
+        if (
+            metadata.requires_non_system_target
+            and target_binding.system_protected
+        ):
+            reasons.append(
+                "METHOD_CONSTRAINT_SYSTEM_TARGET"
+            )
+
+        if (
+            metadata.requires_unprotected
+            and target_binding.protected
+        ):
+            reasons.append(
+                "METHOD_CONSTRAINT_TARGET_PROTECTED"
+            )
+
+        if (
+            metadata.requires_unmounted
+            and target_binding.mounted
+        ):
+            reasons.append(
+                "METHOD_CONSTRAINT_TARGET_MOUNTED"
+            )
+
+        if (
+            metadata.requires_writable
+            and target_binding.read_only
+        ):
+            reasons.append(
+                "METHOD_CONSTRAINT_TARGET_READ_ONLY"
+            )
+
+        if (
+            metadata.requires_unambiguous_target
+            and target_binding.ambiguous
+        ):
+            reasons.append(
+                "METHOD_CONSTRAINT_TARGET_AMBIGUOUS"
+            )
+
+        if (
+            metadata.requires_no_review_required
+            and target_binding.review_required
+        ):
+            reasons.append(
+                "METHOD_CONSTRAINT_TARGET_REVIEW_REQUIRED"
+            )
+
+    reason_codes = tuple(
+        dict.fromkeys(reasons)
+    )
+
+    return SanitizationMethodConstraintEvaluation(
+        method_profile_id=raw_method_profile_id,
+        target_binding_hash=target_binding_hash,
+        status=_sanitization_method_constraint_status(
+            reason_codes
+        ),
+        reason_codes=reason_codes,
+    )
+
 
 def _contains_forbidden_control(value: str) -> bool:
     return any(
@@ -2967,6 +3253,11 @@ __all__ = [
     "TargetIdentityBinding",
     "SanitizationMethodPolicy",
     "SanitizationMethodCapabilityMetadata",
+    "SanitizationMethodConstraintEvaluation",
+    "METHOD_CONSTRAINT_STATUS_SATISFIED",
+    "METHOD_CONSTRAINT_STATUS_REVIEW_REQUIRED",
+    "METHOD_CONSTRAINT_STATUS_REFUSED",
+    "METHOD_CONSTRAINT_STATUS_EVALUATION_FAILED",
     "POLICY_VERSION",
     "SCHEMA_VERSION",
     "EVIDENCE_ORIGIN",
@@ -2985,6 +3276,7 @@ __all__ = [
     "evaluate_current_authorization_prerequisites",
     "get_sanitization_method_policy",
     "get_sanitization_method_capability_metadata",
+    "evaluate_sanitization_method_constraints",
     "record_snapshot_hash",
     "request_hash",
 ]

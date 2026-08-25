@@ -4930,5 +4930,517 @@ class Phase5AuthorizationR2Tests(unittest.TestCase):
                 lookup_source,
             )
 
+    def test_phase6bc_exact_safe_binding_satisfies_constraints(
+        self,
+    ):
+        binding = auth.TargetIdentityBinding(
+            path="/dev/syn-a",
+            serial="SERIAL-A",
+            wwn="WWN-A",
+            size_bytes=1_000_000,
+            model="Synthetic Model",
+            transport="usb",
+            read_only=False,
+            mounted=False,
+            protected=False,
+            system_protected=False,
+            review_required=False,
+            ambiguous=False,
+        )
+
+        result = auth.evaluate_sanitization_method_constraints(
+            "phase5-policy-only",
+            binding,
+        )
+
+        self.assertIsInstance(
+            result,
+            auth.SanitizationMethodConstraintEvaluation,
+        )
+
+        self.assertEqual(
+            result.method_profile_id,
+            "phase5-policy-only",
+        )
+
+        self.assertIsInstance(
+            result.target_binding_hash,
+            str,
+        )
+
+        self.assertTrue(
+            result.target_binding_hash.startswith(
+                "sha256:"
+            )
+        )
+
+        self.assertEqual(
+            result.status,
+            auth.METHOD_CONSTRAINT_STATUS_SATISFIED,
+        )
+
+        self.assertEqual(
+            result.reason_codes,
+            (),
+        )
+
+    def test_phase6bc_constraint_evaluation_is_frozen_and_deterministic(
+        self,
+    ):
+        binding = auth.TargetIdentityBinding(
+            path="/dev/syn-a",
+            serial="SERIAL-A",
+            wwn="WWN-A",
+            size_bytes=1_000_000,
+            model="Synthetic Model",
+            transport="usb",
+            read_only=False,
+            mounted=False,
+            protected=False,
+            system_protected=False,
+            review_required=False,
+            ambiguous=False,
+        )
+
+        first = auth.evaluate_sanitization_method_constraints(
+            "phase5-policy-only",
+            binding,
+        )
+
+        second = auth.evaluate_sanitization_method_constraints(
+            "phase5-policy-only",
+            binding,
+        )
+
+        self.assertEqual(first, second)
+
+        with self.assertRaises(FrozenInstanceError):
+            first.status = "other"
+
+    def test_phase6bc_target_binding_hash_changes_with_binding(
+        self,
+    ):
+        first_binding = auth.TargetIdentityBinding(
+            path="/dev/syn-a",
+            serial="SERIAL-A",
+            wwn="WWN-A",
+            size_bytes=1_000_000,
+            model="Synthetic Model",
+            transport="usb",
+            read_only=False,
+            mounted=False,
+            protected=False,
+            system_protected=False,
+            review_required=False,
+            ambiguous=False,
+        )
+
+        second_binding = replace(
+            first_binding,
+            path="/dev/syn-b",
+        )
+
+        first = auth.evaluate_sanitization_method_constraints(
+            "phase5-policy-only",
+            first_binding,
+        )
+
+        second = auth.evaluate_sanitization_method_constraints(
+            "phase5-policy-only",
+            second_binding,
+        )
+
+        self.assertEqual(
+            first.status,
+            auth.METHOD_CONSTRAINT_STATUS_SATISFIED,
+        )
+
+        self.assertEqual(
+            second.status,
+            auth.METHOD_CONSTRAINT_STATUS_SATISFIED,
+        )
+
+        self.assertNotEqual(
+            first.target_binding_hash,
+            second.target_binding_hash,
+        )
+
+    def test_phase6bc_unknown_or_malformed_method_fails_closed(
+        self,
+    ):
+        binding = auth.TargetIdentityBinding(
+            path="/dev/syn-a",
+            serial="SERIAL-A",
+            wwn="WWN-A",
+            size_bytes=1_000_000,
+            model="Synthetic Model",
+            transport="usb",
+            read_only=False,
+            mounted=False,
+            protected=False,
+            system_protected=False,
+            review_required=False,
+            ambiguous=False,
+        )
+
+        for method_profile_id in (
+            None,
+            True,
+            0,
+            "",
+            "   ",
+            "phase5-policy-only ",
+            " phase5-policy-only",
+            "PHASE5-POLICY-ONLY",
+            "unknown",
+        ):
+            with self.subTest(
+                method_profile_id=repr(
+                    method_profile_id
+                )
+            ):
+                result = (
+                    auth.evaluate_sanitization_method_constraints(
+                        method_profile_id,
+                        binding,
+                    )
+                )
+
+                self.assertEqual(
+                    result.status,
+                    auth.METHOD_CONSTRAINT_STATUS_EVALUATION_FAILED,
+                )
+
+                self.assertIn(
+                    "METHOD_CONSTRAINT_METADATA_UNAVAILABLE",
+                    result.reason_codes,
+                )
+
+                self.assertIsNotNone(
+                    result.target_binding_hash
+                )
+
+                self.assertEqual(
+                    result.method_profile_id,
+                    (
+                        method_profile_id
+                        if isinstance(
+                            method_profile_id,
+                            str,
+                        )
+                        else ""
+                    ),
+                )
+
+    def test_phase6bc_malformed_target_binding_fails_closed(
+        self,
+    ):
+        binding = auth.TargetIdentityBinding(
+            path="/dev/syn-a",
+            serial="SERIAL-A",
+            wwn="WWN-A",
+            size_bytes=1_000_000,
+            model="Synthetic Model",
+            transport="usb",
+            read_only=False,
+            mounted=False,
+            protected=False,
+            system_protected=False,
+            review_required=False,
+            ambiguous=False,
+        )
+
+        malformed = (
+            None,
+            replace(
+                binding,
+                path="   ",
+            ),
+            replace(
+                binding,
+                size_bytes=0,
+            ),
+            replace(
+                binding,
+                mounted=1,
+            ),
+            replace(
+                binding,
+                serial=123,
+            ),
+        )
+
+        for candidate in malformed:
+            with self.subTest(
+                candidate=repr(candidate)
+            ):
+                result = (
+                    auth.evaluate_sanitization_method_constraints(
+                        "phase5-policy-only",
+                        candidate,
+                    )
+                )
+
+                self.assertEqual(
+                    result.status,
+                    auth.METHOD_CONSTRAINT_STATUS_EVALUATION_FAILED,
+                )
+
+                self.assertEqual(
+                    result.reason_codes,
+                    (
+                        "METHOD_CONSTRAINT_TARGET_BINDING_INVALID",
+                    ),
+                )
+
+                self.assertIsNone(
+                    result.target_binding_hash
+                )
+
+    def test_phase6bc_strong_identity_constraint_fails_closed(
+        self,
+    ):
+        binding = auth.TargetIdentityBinding(
+            path="/dev/syn-a",
+            serial=None,
+            wwn=None,
+            size_bytes=1_000_000,
+            model="Synthetic Model",
+            transport="usb",
+            read_only=False,
+            mounted=False,
+            protected=False,
+            system_protected=False,
+            review_required=False,
+            ambiguous=False,
+        )
+
+        result = auth.evaluate_sanitization_method_constraints(
+            "phase5-policy-only",
+            binding,
+        )
+
+        self.assertEqual(
+            result.status,
+            auth.METHOD_CONSTRAINT_STATUS_EVALUATION_FAILED,
+        )
+
+        self.assertEqual(
+            result.reason_codes,
+            (
+                "METHOD_CONSTRAINT_STRONG_IDENTITY_REQUIRED",
+            ),
+        )
+
+        self.assertIsNotNone(
+            result.target_binding_hash
+        )
+
+    def test_phase6bc_hard_constraints_refuse(
+        self,
+    ):
+        binding = auth.TargetIdentityBinding(
+            path="/dev/syn-a",
+            serial="SERIAL-A",
+            wwn="WWN-A",
+            size_bytes=1_000_000,
+            model="Synthetic Model",
+            transport="usb",
+            read_only=False,
+            mounted=False,
+            protected=False,
+            system_protected=False,
+            review_required=False,
+            ambiguous=False,
+        )
+
+        cases = (
+            (
+                replace(
+                    binding,
+                    system_protected=True,
+                ),
+                "METHOD_CONSTRAINT_SYSTEM_TARGET",
+            ),
+            (
+                replace(
+                    binding,
+                    protected=True,
+                ),
+                "METHOD_CONSTRAINT_TARGET_PROTECTED",
+            ),
+            (
+                replace(
+                    binding,
+                    mounted=True,
+                ),
+                "METHOD_CONSTRAINT_TARGET_MOUNTED",
+            ),
+            (
+                replace(
+                    binding,
+                    read_only=True,
+                ),
+                "METHOD_CONSTRAINT_TARGET_READ_ONLY",
+            ),
+        )
+
+        for candidate, expected_reason in cases:
+            with self.subTest(
+                expected_reason=expected_reason
+            ):
+                result = (
+                    auth.evaluate_sanitization_method_constraints(
+                        "phase5-policy-only",
+                        candidate,
+                    )
+                )
+
+                self.assertEqual(
+                    result.status,
+                    auth.METHOD_CONSTRAINT_STATUS_REFUSED,
+                )
+
+                self.assertEqual(
+                    result.reason_codes,
+                    (expected_reason,),
+                )
+
+    def test_phase6bc_review_constraints_require_review(
+        self,
+    ):
+        binding = auth.TargetIdentityBinding(
+            path="/dev/syn-a",
+            serial="SERIAL-A",
+            wwn="WWN-A",
+            size_bytes=1_000_000,
+            model="Synthetic Model",
+            transport="usb",
+            read_only=False,
+            mounted=False,
+            protected=False,
+            system_protected=False,
+            review_required=False,
+            ambiguous=False,
+        )
+
+        cases = (
+            (
+                replace(
+                    binding,
+                    ambiguous=True,
+                ),
+                "METHOD_CONSTRAINT_TARGET_AMBIGUOUS",
+            ),
+            (
+                replace(
+                    binding,
+                    review_required=True,
+                ),
+                "METHOD_CONSTRAINT_TARGET_REVIEW_REQUIRED",
+            ),
+        )
+
+        for candidate, expected_reason in cases:
+            with self.subTest(
+                expected_reason=expected_reason
+            ):
+                result = (
+                    auth.evaluate_sanitization_method_constraints(
+                        "phase5-policy-only",
+                        candidate,
+                    )
+                )
+
+                self.assertEqual(
+                    result.status,
+                    auth.METHOD_CONSTRAINT_STATUS_REVIEW_REQUIRED,
+                )
+
+                self.assertEqual(
+                    result.reason_codes,
+                    (expected_reason,),
+                )
+
+    def test_phase6bc_status_precedence_and_no_execution_surface(
+        self,
+    ):
+        binding = auth.TargetIdentityBinding(
+            path="/dev/syn-a",
+            serial="SERIAL-A",
+            wwn="WWN-A",
+            size_bytes=1_000_000,
+            model="Synthetic Model",
+            transport="usb",
+            read_only=False,
+            mounted=True,
+            protected=False,
+            system_protected=False,
+            review_required=True,
+            ambiguous=True,
+        )
+
+        result = auth.evaluate_sanitization_method_constraints(
+            "phase5-policy-only",
+            binding,
+        )
+
+        self.assertEqual(
+            result.status,
+            auth.METHOD_CONSTRAINT_STATUS_REFUSED,
+        )
+
+        self.assertEqual(
+            result.reason_codes,
+            (
+                "METHOD_CONSTRAINT_TARGET_MOUNTED",
+                "METHOD_CONSTRAINT_TARGET_AMBIGUOUS",
+                "METHOD_CONSTRAINT_TARGET_REVIEW_REQUIRED",
+            ),
+        )
+
+        field_names = {
+            field.name
+            for field in fields(
+                auth.SanitizationMethodConstraintEvaluation
+            )
+        }
+
+        for forbidden in (
+            "authorized",
+            "approved",
+            "command",
+            "executable",
+            "callback",
+            "executor",
+            "device",
+            "path",
+            "argv",
+            "arguments",
+        ):
+            self.assertNotIn(
+                forbidden,
+                field_names,
+            )
+
+        source = inspect.getsource(
+            auth.evaluate_sanitization_method_constraints
+        )
+
+        for forbidden in (
+            "subprocess",
+            "os.system",
+            "Popen",
+            "shell=True",
+            "exec(",
+            "eval(",
+            "collect_current_drive_discovery",
+            "/dev/",
+        ):
+            self.assertNotIn(
+                forbidden,
+                source,
+            )
+
 if __name__ == "__main__":
     unittest.main()
