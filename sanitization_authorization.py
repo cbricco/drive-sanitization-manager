@@ -55,10 +55,66 @@ STATUS_EVALUATION_FAILED = "evaluation_failed"
 
 SUPPORTED_OPERATIONS = frozenset({"sanitize"})
 
-# Deliberately non-executable.  A real destructive method belongs to Phase 6.
-NON_EXECUTABLE_METHOD_PROFILES = frozenset({
-    "phase5-policy-only",
-})
+@dataclass(frozen=True)
+class SanitizationMethodPolicy:
+    """Static sanitization method metadata.
+
+    This model carries policy metadata only.  It contains no command,
+    executable, callback, device handle, or execution authority.
+    """
+
+    method_profile_id: str
+    operation: str
+    policy_only: bool
+    execution_supported: bool
+
+
+# Private deterministic registry.  The tuple and its frozen records contain
+# policy metadata only; they do not contain execution implementations.
+_SANITIZATION_METHOD_POLICIES = (
+    SanitizationMethodPolicy(
+        method_profile_id="phase5-policy-only",
+        operation="sanitize",
+        policy_only=True,
+        execution_supported=False,
+    ),
+)
+
+
+# Compatibility view retained for existing Phase 5 policy checks/tests.
+# The authoritative Phase 6B lookup is get_sanitization_method_policy().
+NON_EXECUTABLE_METHOD_PROFILES = frozenset(
+    policy.method_profile_id
+    for policy in _SANITIZATION_METHOD_POLICIES
+    if (
+        policy.policy_only
+        and not policy.execution_supported
+    )
+)
+
+
+def get_sanitization_method_policy(
+    method_profile_id: Any,
+) -> Optional[SanitizationMethodPolicy]:
+    """Return trusted static metadata for one exact method-profile ID."""
+
+    if (
+        not isinstance(method_profile_id, str)
+        or not method_profile_id
+        or method_profile_id != method_profile_id.strip()
+        or any(
+            ord(character) < 32
+            or ord(character) == 127
+            for character in method_profile_id
+        )
+    ):
+        return None
+
+    for policy in _SANITIZATION_METHOD_POLICIES:
+        if policy.method_profile_id == method_profile_id:
+            return policy
+
+    return None
 
 
 class AuthorizationError(ValueError):
@@ -146,6 +202,8 @@ _REASON_CLASS = {
     "OPERATION_UNSUPPORTED": STATUS_REFUSED,
     "METHOD_PROFILE_MISSING": STATUS_REFUSED,
     "METHOD_PROFILE_UNSUPPORTED": STATUS_REFUSED,
+    "METHOD_PROFILE_UNKNOWN": STATUS_REFUSED,
+    "METHOD_PROFILE_OPERATION_MISMATCH": STATUS_REFUSED,
     "INTENDED_ACTION_MISSING": STATUS_REFUSED,
     "INTENDED_ACTION_MISMATCH": STATUS_REFUSED,
     "RECORDED_SYSTEM_PROTECTED": STATUS_REFUSED,
@@ -799,27 +857,48 @@ def _evaluate_collected_evidence(
     ):
         reasons.append("RECORD_ID_MISMATCH")
 
-    operation = (
-        request.operation.strip()
+    operation_value = (
+        request.operation
         if isinstance(request.operation, str)
         else ""
     )
 
-    method = (
-        request.method_profile_id.strip()
+    operation = operation_value.strip()
+
+    method_profile_id = (
+        request.method_profile_id
         if isinstance(request.method_profile_id, str)
         else ""
     )
 
+    method = method_profile_id.strip()
+
     if not operation:
         reasons.append("OPERATION_MISSING")
-    elif operation not in SUPPORTED_OPERATIONS:
+    elif operation_value not in SUPPORTED_OPERATIONS:
         reasons.append("OPERATION_UNSUPPORTED")
+
+    method_policy = None
 
     if not method:
         reasons.append("METHOD_PROFILE_MISSING")
-    elif method not in NON_EXECUTABLE_METHOD_PROFILES:
-        reasons.append("METHOD_PROFILE_UNSUPPORTED")
+    else:
+        method_policy = get_sanitization_method_policy(
+            method_profile_id
+        )
+
+        if method_policy is None:
+            # Preserve the established Phase 5 reason while adding the
+            # more precise Phase 6B registry result.
+            reasons.append("METHOD_PROFILE_UNSUPPORTED")
+            reasons.append("METHOD_PROFILE_UNKNOWN")
+        elif (
+            operation
+            and method_policy.operation != operation_value
+        ):
+            reasons.append(
+                "METHOD_PROFILE_OPERATION_MISMATCH"
+            )
 
     record_hash = _safe_record_hash(record)
 
@@ -2695,6 +2774,7 @@ __all__ = [
     "AuthorizationError",
     "AuthorizationRequest",
     "TargetIdentityBinding",
+    "SanitizationMethodPolicy",
     "POLICY_VERSION",
     "SCHEMA_VERSION",
     "EVIDENCE_ORIGIN",
@@ -2711,6 +2791,7 @@ __all__ = [
     "decision_is_current",
     "discovery_snapshot_hash",
     "evaluate_current_authorization_prerequisites",
+    "get_sanitization_method_policy",
     "record_snapshot_hash",
     "request_hash",
 ]

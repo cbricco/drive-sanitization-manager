@@ -4336,5 +4336,306 @@ class Phase5AuthorizationR2Tests(unittest.TestCase):
             )
         )
 
+    def test_phase6b_known_method_policy_metadata_is_exact(
+        self,
+    ):
+        policy = auth.get_sanitization_method_policy(
+            "phase5-policy-only"
+        )
+
+        self.assertIsInstance(
+            policy,
+            auth.SanitizationMethodPolicy,
+        )
+
+        self.assertEqual(
+            policy.method_profile_id,
+            "phase5-policy-only",
+        )
+
+        self.assertEqual(
+            policy.operation,
+            "sanitize",
+        )
+
+        self.assertTrue(policy.policy_only)
+        self.assertFalse(policy.execution_supported)
+
+        self.assertEqual(
+            [field.name for field in fields(
+                auth.SanitizationMethodPolicy
+            )],
+            [
+                "method_profile_id",
+                "operation",
+                "policy_only",
+                "execution_supported",
+            ],
+        )
+
+    def test_phase6b_method_policy_is_frozen(
+        self,
+    ):
+        policy = auth.get_sanitization_method_policy(
+            "phase5-policy-only"
+        )
+
+        self.assertIsNotNone(policy)
+
+        with self.assertRaises(FrozenInstanceError):
+            policy.operation = "other"
+
+    def test_phase6b_method_policy_lookup_is_deterministic(
+        self,
+    ):
+        first = auth.get_sanitization_method_policy(
+            "phase5-policy-only"
+        )
+
+        second = auth.get_sanitization_method_policy(
+            "phase5-policy-only"
+        )
+
+        self.assertIsNotNone(first)
+        self.assertIs(first, second)
+
+        self.assertIsInstance(
+            auth._SANITIZATION_METHOD_POLICIES,
+            tuple,
+        )
+
+        self.assertEqual(
+            auth._SANITIZATION_METHOD_POLICIES,
+            (first,),
+        )
+
+    def test_phase6b_unknown_and_malformed_policy_lookup_fails_closed(
+        self,
+    ):
+        malformed = (
+            None,
+            123,
+            "",
+            "   ",
+            "phase5-policy-only ",
+            " phase5-policy-only",
+            "phase5-\npolicy-only",
+            "unknown",
+        )
+
+        for value in malformed:
+            with self.subTest(value=repr(value)):
+                self.assertIsNone(
+                    auth.get_sanitization_method_policy(
+                        value
+                    )
+                )
+
+    def test_phase6b_known_policy_preserves_positive_prerequisite_path(
+        self,
+    ):
+        decision = self.evaluate()
+
+        self.assertEqual(
+            decision.status,
+            STATUS_PREREQUISITES_MET,
+        )
+
+        self.assertEqual(
+            decision.reason_codes,
+            (),
+        )
+
+    def test_phase6b_unknown_policy_refuses_with_precise_reason(
+        self,
+    ):
+        record = self.record()
+
+        request = replace(
+            self.request(record),
+            method_profile_id="unknown",
+        )
+
+        decision = self.evaluate(
+            record=record,
+            request=request,
+        )
+
+        self.assertEqual(
+            decision.status,
+            STATUS_REFUSED,
+        )
+
+        self.assertReason(
+            decision,
+            "METHOD_PROFILE_UNSUPPORTED",
+        )
+
+        self.assertReason(
+            decision,
+            "METHOD_PROFILE_UNKNOWN",
+        )
+
+    def test_phase6b_known_policy_wrong_operation_refuses(
+        self,
+    ):
+        record = self.record()
+
+        request = replace(
+            self.request(record),
+            operation="other",
+        )
+
+        decision = self.evaluate(
+            record=record,
+            request=request,
+        )
+
+        self.assertEqual(
+            decision.status,
+            STATUS_REFUSED,
+        )
+
+        self.assertReason(
+            decision,
+            "OPERATION_UNSUPPORTED",
+        )
+
+        self.assertReason(
+            decision,
+            "METHOD_PROFILE_OPERATION_MISMATCH",
+        )
+
+    def test_phase6b_policy_registry_preserves_request_hash_binding_without_execution(
+        self,
+    ):
+        request = self.request()
+
+        changed = replace(
+            request,
+            method_profile_id="unknown",
+        )
+
+        self.assertNotEqual(
+            request_hash(request),
+            request_hash(changed),
+        )
+
+        policy = auth.get_sanitization_method_policy(
+            "phase5-policy-only"
+        )
+
+        self.assertIsNotNone(policy)
+        self.assertTrue(policy.policy_only)
+        self.assertFalse(policy.execution_supported)
+
+        field_names = {
+            field.name
+            for field in fields(
+                auth.SanitizationMethodPolicy
+            )
+        }
+
+        for forbidden in (
+            "command",
+            "executable",
+            "callback",
+            "device",
+            "path",
+            "executor",
+        ):
+            self.assertNotIn(
+                forbidden,
+                field_names,
+            )
+
+    def test_phase6b_evaluator_does_not_normalize_method_profile_id(
+        self,
+    ):
+        record = self.record()
+        request = self.request(record)
+
+        malformed_or_nonexact = (
+            "phase5-policy-only ",
+            " phase5-policy-only",
+            "PHASE5-POLICY-ONLY",
+            "phase5-\npolicy-only",
+        )
+
+        for method_profile_id in malformed_or_nonexact:
+            with self.subTest(
+                method_profile_id=repr(method_profile_id)
+            ):
+                decision = self.evaluate(
+                    record=record,
+                    request=replace(
+                        request,
+                        method_profile_id=method_profile_id,
+                    ),
+                )
+
+                self.assertEqual(
+                    decision.status,
+                    STATUS_REFUSED,
+                )
+
+                self.assertReason(
+                    decision,
+                    "METHOD_PROFILE_UNSUPPORTED",
+                )
+
+                self.assertReason(
+                    decision,
+                    "METHOD_PROFILE_UNKNOWN",
+                )
+
+    def test_phase6b_evaluator_does_not_normalize_operation(
+        self,
+    ):
+        record = self.record()
+        request = self.request(record)
+
+        malformed_or_nonexact = (
+            "sanitize ",
+            " sanitize",
+            "SANITIZE",
+            "sanitize\t",
+            "sanitize\n",
+        )
+
+        for operation in malformed_or_nonexact:
+            with self.subTest(
+                operation=repr(operation)
+            ):
+                changed = replace(
+                    request,
+                    operation=operation,
+                )
+
+                self.assertNotEqual(
+                    request_hash(request),
+                    request_hash(changed),
+                )
+
+                decision = self.evaluate(
+                    record=record,
+                    request=changed,
+                )
+
+                self.assertEqual(
+                    decision.status,
+                    STATUS_REFUSED,
+                )
+
+                self.assertReason(
+                    decision,
+                    "OPERATION_UNSUPPORTED",
+                )
+
+                self.assertReason(
+                    decision,
+                    "METHOD_PROFILE_OPERATION_MISMATCH",
+                )
+
 if __name__ == "__main__":
     unittest.main()
