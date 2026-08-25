@@ -3585,6 +3585,11 @@ class ApprovalRegistry:
             ],
         ] = {}
 
+        # Phase 6D-B: successful currentness gates consume
+        # one exact trusted 6D-A binding ID once per process.
+        # This grants no device or command authority.
+        self._consumed_execution_bindings: set[str] = set()
+
     def create_challenge(
         self,
         request: AuthorizationRequest,
@@ -4984,6 +4989,536 @@ def build_trusted_execution_binding(
         )
 
     return binding
+
+EXECUTION_GATE_POLICY_VERSION = (
+    "phase6d-b-one-shot-currentness-v1"
+)
+EXECUTION_GATE_SCHEMA_VERSION = 1
+EXECUTION_GATE_STATUS_SATISFIED = (
+    "execution_gate_satisfied"
+)
+
+
+class OneShotExecutionGateError(
+    AuthorizationError
+):
+    """One-shot execution-gate conditions failed closed."""
+
+
+@dataclass(frozen=True)
+class OneShotExecutionGateDecision:
+    """Frozen evidence that one trusted binding passed a time gate.
+
+    A satisfied gate proves only that the exact 6D-A binding was current
+    when this process atomically consumed that binding ID.
+
+    It is not an executor, command, device capability, sanitization result,
+    verification result, or physical-device success claim.
+    """
+
+    gate_id: str
+    policy_version: str
+    schema_version: int
+    status: str
+    binding_id: str
+    approval_id: str
+    challenge_id: str
+    approval_evidence_hash: str
+    revalidation_id: str
+    request_id: str
+    request_hash: str
+    record_snapshot_hash: str
+    fresh_prerequisite_decision_id: str
+    method_profile_id: str
+    operation: str
+    target_binding_hash: str
+    constraint_evaluation_hash: str
+    evaluated_at_utc: str
+    prerequisite_valid_until_utc: str
+
+
+def _one_shot_execution_gate_payload(
+    *,
+    policy_version: str,
+    schema_version: int,
+    status: str,
+    binding_id: str,
+    approval_id: str,
+    challenge_id: str,
+    approval_evidence_hash: str,
+    revalidation_id: str,
+    request_id: str,
+    request_hash: str,
+    record_snapshot_hash: str,
+    fresh_prerequisite_decision_id: str,
+    method_profile_id: str,
+    operation: str,
+    target_binding_hash: str,
+    constraint_evaluation_hash: str,
+    evaluated_at_utc: str,
+    prerequisite_valid_until_utc: str,
+) -> dict[str, Any]:
+    return {
+        "policy_version": policy_version,
+        "schema_version": schema_version,
+        "status": status,
+        "binding_id": binding_id,
+        "approval_id": approval_id,
+        "challenge_id": challenge_id,
+        "approval_evidence_hash":
+            approval_evidence_hash,
+        "revalidation_id": revalidation_id,
+        "request_id": request_id,
+        "request_hash": request_hash,
+        "record_snapshot_hash":
+            record_snapshot_hash,
+        "fresh_prerequisite_decision_id":
+            fresh_prerequisite_decision_id,
+        "method_profile_id": method_profile_id,
+        "operation": operation,
+        "target_binding_hash":
+            target_binding_hash,
+        "constraint_evaluation_hash":
+            constraint_evaluation_hash,
+        "evaluated_at_utc": evaluated_at_utc,
+        "prerequisite_valid_until_utc":
+            prerequisite_valid_until_utc,
+    }
+
+
+def _one_shot_execution_gate_integrity_valid(
+    gate: Any,
+) -> bool:
+    """Check gate-object internal consistency only."""
+
+    try:
+        if not isinstance(
+            gate,
+            OneShotExecutionGateDecision,
+        ):
+            return False
+
+        if (
+            gate.policy_version
+            != EXECUTION_GATE_POLICY_VERSION
+            or type(gate.schema_version) is not int
+            or gate.schema_version
+            != EXECUTION_GATE_SCHEMA_VERSION
+            or gate.status
+            != EXECUTION_GATE_STATUS_SATISFIED
+        ):
+            return False
+
+        if (
+            not isinstance(gate.binding_id, str)
+            or not gate.binding_id.startswith("xeb_")
+            or len(gate.binding_id)
+            != len("xeb_") + 64
+            or not all(
+                character in "0123456789abcdef"
+                for character
+                in gate.binding_id[len("xeb_"):]
+            )
+        ):
+            return False
+
+        if (
+            not isinstance(gate.gate_id, str)
+            or not gate.gate_id.startswith("xgate_")
+            or len(gate.gate_id)
+            != len("xgate_") + 64
+            or not all(
+                character in "0123456789abcdef"
+                for character
+                in gate.gate_id[len("xgate_"):]
+            )
+        ):
+            return False
+
+        for value in (
+            gate.approval_id,
+            gate.challenge_id,
+            gate.request_id,
+        ):
+            if not _approval_text(value):
+                return False
+
+        for value in (
+            gate.method_profile_id,
+            gate.operation,
+        ):
+            if not _synthetic_plan_exact_text(value):
+                return False
+
+        for hash_value in (
+            gate.approval_evidence_hash,
+            gate.revalidation_id,
+            gate.request_hash,
+            gate.record_snapshot_hash,
+            gate.fresh_prerequisite_decision_id,
+            gate.target_binding_hash,
+            gate.constraint_evaluation_hash,
+        ):
+            if not _synthetic_plan_hash_value(
+                hash_value
+            ):
+                return False
+
+        evaluated_at = _parse_utc(
+            gate.evaluated_at_utc,
+            "gate.evaluated_at_utc",
+        )
+
+        valid_until = _parse_utc(
+            gate.prerequisite_valid_until_utc,
+            "gate.prerequisite_valid_until_utc",
+        )
+
+        if (
+            _iso_utc(evaluated_at)
+            != gate.evaluated_at_utc
+            or _iso_utc(valid_until)
+            != gate.prerequisite_valid_until_utc
+            or evaluated_at > valid_until
+        ):
+            return False
+
+        payload = _one_shot_execution_gate_payload(
+            policy_version=gate.policy_version,
+            schema_version=gate.schema_version,
+            status=gate.status,
+            binding_id=gate.binding_id,
+            approval_id=gate.approval_id,
+            challenge_id=gate.challenge_id,
+            approval_evidence_hash=(
+                gate.approval_evidence_hash
+            ),
+            revalidation_id=gate.revalidation_id,
+            request_id=gate.request_id,
+            request_hash=gate.request_hash,
+            record_snapshot_hash=(
+                gate.record_snapshot_hash
+            ),
+            fresh_prerequisite_decision_id=(
+                gate.fresh_prerequisite_decision_id
+            ),
+            method_profile_id=gate.method_profile_id,
+            operation=gate.operation,
+            target_binding_hash=(
+                gate.target_binding_hash
+            ),
+            constraint_evaluation_hash=(
+                gate.constraint_evaluation_hash
+            ),
+            evaluated_at_utc=gate.evaluated_at_utc,
+            prerequisite_valid_until_utc=(
+                gate.prerequisite_valid_until_utc
+            ),
+        )
+
+        expected_hash = _canonical_hash(payload)
+
+        return (
+            gate.gate_id
+            == (
+                "xgate_"
+                + expected_hash.split(":", 1)[1]
+            )
+        )
+
+    except Exception:
+        return False
+
+
+def satisfy_one_shot_execution_gate(
+    *,
+    registry: Any,
+    approval_id: Any,
+    request: Any,
+    record: Any,
+) -> OneShotExecutionGateDecision:
+    """Atomically consume one current registry-backed 6D-A binding."""
+
+    if not isinstance(
+        registry,
+        ApprovalRegistry,
+    ):
+        raise OneShotExecutionGateError(
+            "registry is invalid"
+        )
+
+    try:
+        binding = build_trusted_execution_binding(
+            registry=registry,
+            approval_id=approval_id,
+            request=request,
+            record=record,
+        )
+    except TrustedExecutionBindingError as exc:
+        raise OneShotExecutionGateError(
+            "trusted execution binding is unavailable"
+        ) from exc
+
+    if not _trusted_execution_binding_integrity_valid(
+        binding
+    ):
+        raise OneShotExecutionGateError(
+            "trusted execution binding integrity is invalid"
+        )
+
+    try:
+        revalidated_at = _parse_utc(
+            binding.revalidated_at_utc,
+            "binding.revalidated_at_utc",
+        )
+
+        valid_until = _parse_utc(
+            binding.prerequisite_valid_until_utc,
+            "binding.prerequisite_valid_until_utc",
+        )
+    except AuthorizationError as exc:
+        raise OneShotExecutionGateError(
+            "execution binding timestamps are invalid"
+        ) from exc
+
+    first_now = _aware_utc(_utc_now())
+
+    if first_now is None:
+        raise OneShotExecutionGateError(
+            "internal clock is invalid"
+        )
+
+    if (
+        first_now
+        < revalidated_at
+        - timedelta(
+            seconds=MAX_FUTURE_SKEW_SECONDS
+        )
+    ):
+        raise OneShotExecutionGateError(
+            "internal clock rolled back before gate evaluation"
+        )
+
+    if first_now > valid_until:
+        raise OneShotExecutionGateError(
+            "execution binding is stale"
+        )
+
+    with registry._state_lock:
+        evidence = registry._approvals.get(
+            approval_id
+        )
+
+        retained = (
+            registry._successful_revalidations.get(
+                approval_id
+            )
+        )
+
+        challenge = registry._challenges.get(
+            binding.challenge_id
+        )
+
+        if (
+            not isinstance(
+                evidence,
+                HumanApprovalEvidence,
+            )
+            or not isinstance(
+                challenge,
+                ApprovalChallenge,
+            )
+            or not isinstance(retained, tuple)
+            or len(retained) != 2
+            or approval_id
+            not in registry._consumed_approvals
+            or challenge.challenge_id
+            not in registry._approved_challenges
+        ):
+            raise OneShotExecutionGateError(
+                "registry provenance changed before gate consumption"
+            )
+
+        revalidation, fresh = retained
+
+        if (
+            not isinstance(
+                revalidation,
+                ApprovalRevalidationDecision,
+            )
+            or not isinstance(
+                fresh,
+                AuthorizationDecision,
+            )
+            or evidence.approval_id
+            != binding.approval_id
+            or evidence.challenge_id
+            != binding.challenge_id
+            or evidence.evidence_hash
+            != binding.approval_evidence_hash
+            or revalidation.revalidation_id
+            != binding.revalidation_id
+            or revalidation.request_id
+            != binding.request_id
+            or revalidation.evaluated_at_utc
+            != binding.revalidated_at_utc
+            or fresh.decision_id
+            != binding.fresh_prerequisite_decision_id
+            or fresh.request_hash
+            != binding.request_hash
+            or fresh.record_snapshot_hash
+            != binding.record_snapshot_hash
+            or fresh.target_binding_hash
+            != binding.target_binding_hash
+            or fresh.prerequisite_valid_until_utc
+            != binding.prerequisite_valid_until_utc
+        ):
+            raise OneShotExecutionGateError(
+                "registry evidence changed before gate consumption"
+            )
+
+        if (
+            binding.binding_id
+            in registry._consumed_execution_bindings
+        ):
+            raise OneShotExecutionGateError(
+                "execution binding has already been consumed"
+            )
+
+        locked_now = _aware_utc(_utc_now())
+
+        if locked_now is None:
+            raise OneShotExecutionGateError(
+                "internal clock is invalid under gate lock"
+            )
+
+        locked_lower_reference = max(
+            revalidated_at,
+            first_now,
+        )
+
+        if (
+            locked_now
+            < locked_lower_reference
+            - timedelta(
+                seconds=MAX_FUTURE_SKEW_SECONDS
+            )
+        ):
+            raise OneShotExecutionGateError(
+                "internal clock rolled back while waiting for gate lock"
+            )
+
+        if locked_now > valid_until:
+            raise OneShotExecutionGateError(
+                "execution binding expired before atomic consumption"
+            )
+
+        evaluated_at_utc = _iso_utc(
+            locked_now
+        )
+
+        payload = _one_shot_execution_gate_payload(
+            policy_version=(
+                EXECUTION_GATE_POLICY_VERSION
+            ),
+            schema_version=(
+                EXECUTION_GATE_SCHEMA_VERSION
+            ),
+            status=(
+                EXECUTION_GATE_STATUS_SATISFIED
+            ),
+            binding_id=binding.binding_id,
+            approval_id=binding.approval_id,
+            challenge_id=binding.challenge_id,
+            approval_evidence_hash=(
+                binding.approval_evidence_hash
+            ),
+            revalidation_id=binding.revalidation_id,
+            request_id=binding.request_id,
+            request_hash=binding.request_hash,
+            record_snapshot_hash=(
+                binding.record_snapshot_hash
+            ),
+            fresh_prerequisite_decision_id=(
+                binding.fresh_prerequisite_decision_id
+            ),
+            method_profile_id=(
+                binding.method_profile_id
+            ),
+            operation=binding.operation,
+            target_binding_hash=(
+                binding.target_binding_hash
+            ),
+            constraint_evaluation_hash=(
+                binding.constraint_evaluation_hash
+            ),
+            evaluated_at_utc=evaluated_at_utc,
+            prerequisite_valid_until_utc=(
+                binding.prerequisite_valid_until_utc
+            ),
+        )
+
+        payload_hash = _canonical_hash(
+            payload
+        )
+
+        gate = OneShotExecutionGateDecision(
+            gate_id=(
+                "xgate_"
+                + payload_hash.split(":", 1)[1]
+            ),
+            policy_version=(
+                EXECUTION_GATE_POLICY_VERSION
+            ),
+            schema_version=(
+                EXECUTION_GATE_SCHEMA_VERSION
+            ),
+            status=(
+                EXECUTION_GATE_STATUS_SATISFIED
+            ),
+            binding_id=binding.binding_id,
+            approval_id=binding.approval_id,
+            challenge_id=binding.challenge_id,
+            approval_evidence_hash=(
+                binding.approval_evidence_hash
+            ),
+            revalidation_id=binding.revalidation_id,
+            request_id=binding.request_id,
+            request_hash=binding.request_hash,
+            record_snapshot_hash=(
+                binding.record_snapshot_hash
+            ),
+            fresh_prerequisite_decision_id=(
+                binding.fresh_prerequisite_decision_id
+            ),
+            method_profile_id=(
+                binding.method_profile_id
+            ),
+            operation=binding.operation,
+            target_binding_hash=(
+                binding.target_binding_hash
+            ),
+            constraint_evaluation_hash=(
+                binding.constraint_evaluation_hash
+            ),
+            evaluated_at_utc=evaluated_at_utc,
+            prerequisite_valid_until_utc=(
+                binding.prerequisite_valid_until_utc
+            ),
+        )
+
+        if not _one_shot_execution_gate_integrity_valid(
+            gate
+        ):
+            raise OneShotExecutionGateError(
+                "constructed execution gate failed integrity validation"
+            )
+
+        registry._consumed_execution_bindings.add(
+            binding.binding_id
+        )
+
+        return gate
 __all__ = [
     "APPROVAL_POLICY_VERSION",
     "APPROVAL_CHALLENGE_LIFETIME_SECONDS",
@@ -5000,6 +5535,11 @@ __all__ = [
     "EXECUTION_BINDING_POLICY_VERSION",
     "EXECUTION_BINDING_SCHEMA_VERSION",
     "EXECUTION_BINDING_STATUS_SATISFIED",
+    "OneShotExecutionGateDecision",
+    "OneShotExecutionGateError",
+    "EXECUTION_GATE_POLICY_VERSION",
+    "EXECUTION_GATE_SCHEMA_VERSION",
+    "EXECUTION_GATE_STATUS_SATISFIED",
     "AuthorizationDecision",
     "AuthorizationError",
     "AuthorizationRequest",
@@ -5047,6 +5587,7 @@ __all__ = [
     "run_synthetic_sanitization_plan",
     "build_drive_record_with_synthetic_run_evidence",
     "build_trusted_execution_binding",
+    "satisfy_one_shot_execution_gate",
     "record_snapshot_hash",
     "request_hash",
 ]

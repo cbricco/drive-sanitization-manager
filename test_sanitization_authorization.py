@@ -7454,5 +7454,590 @@ class Phase5AuthorizationR2Tests(unittest.TestCase):
                 source,
             )
 
+    def test_phase6db_builds_frozen_current_one_shot_gate(
+        self,
+    ):
+        (
+            registry,
+            record,
+            request,
+            _challenge,
+            evidence,
+            _revalidation,
+            _snapshot,
+            at,
+        ) = self._phase6da_success(
+            request_id="PHASE6DB-GATE"
+        )
+
+        binding = auth.build_trusted_execution_binding(
+            registry=registry,
+            approval_id=evidence.approval_id,
+            request=request,
+            record=record,
+        )
+
+        with patch(
+            "sanitization_authorization._utc_now",
+            return_value=at + timedelta(seconds=2),
+        ):
+            gate = auth.satisfy_one_shot_execution_gate(
+                registry=registry,
+                approval_id=evidence.approval_id,
+                request=request,
+                record=record,
+            )
+
+        self.assertEqual(
+            gate.status,
+            auth.EXECUTION_GATE_STATUS_SATISFIED,
+        )
+
+        self.assertEqual(
+            gate.binding_id,
+            binding.binding_id,
+        )
+
+        self.assertEqual(
+            gate.request_hash,
+            binding.request_hash,
+        )
+
+        self.assertEqual(
+            gate.record_snapshot_hash,
+            binding.record_snapshot_hash,
+        )
+
+        self.assertEqual(
+            gate.target_binding_hash,
+            binding.target_binding_hash,
+        )
+
+        self.assertEqual(
+            gate.method_profile_id,
+            binding.method_profile_id,
+        )
+
+        self.assertEqual(
+            gate.operation,
+            binding.operation,
+        )
+
+        self.assertTrue(
+            auth._one_shot_execution_gate_integrity_valid(
+                gate
+            )
+        )
+
+        self.assertIn(
+            binding.binding_id,
+            registry._consumed_execution_bindings,
+        )
+
+        with self.assertRaises(FrozenInstanceError):
+            gate.status = "other"
+
+    def test_phase6db_replay_is_rejected(
+        self,
+    ):
+        (
+            registry,
+            record,
+            request,
+            _challenge,
+            evidence,
+            _revalidation,
+            _snapshot,
+            at,
+        ) = self._phase6da_success(
+            request_id="PHASE6DB-REPLAY"
+        )
+
+        with patch(
+            "sanitization_authorization._utc_now",
+            return_value=at + timedelta(seconds=2),
+        ):
+            first = auth.satisfy_one_shot_execution_gate(
+                registry=registry,
+                approval_id=evidence.approval_id,
+                request=request,
+                record=record,
+            )
+
+            with self.assertRaisesRegex(
+                auth.OneShotExecutionGateError,
+                "already been consumed",
+            ):
+                auth.satisfy_one_shot_execution_gate(
+                    registry=registry,
+                    approval_id=evidence.approval_id,
+                    request=request,
+                    record=record,
+                )
+
+        self.assertEqual(
+            registry._consumed_execution_bindings,
+            {first.binding_id},
+        )
+
+    def test_phase6db_concurrent_consumption_allows_exactly_one_gate(
+        self,
+    ):
+        from concurrent.futures import ThreadPoolExecutor
+
+        (
+            registry,
+            record,
+            request,
+            _challenge,
+            evidence,
+            _revalidation,
+            _snapshot,
+            at,
+        ) = self._phase6da_success(
+            request_id="PHASE6DB-CONCURRENT"
+        )
+
+        def attempt():
+            try:
+                return (
+                    "ok",
+                    auth.satisfy_one_shot_execution_gate(
+                        registry=registry,
+                        approval_id=evidence.approval_id,
+                        request=request,
+                        record=record,
+                    ),
+                )
+            except auth.OneShotExecutionGateError as exc:
+                return ("error", str(exc))
+
+        with patch(
+            "sanitization_authorization._utc_now",
+            return_value=at + timedelta(seconds=2),
+        ):
+            with ThreadPoolExecutor(
+                max_workers=8
+            ) as executor:
+                results = list(
+                    executor.map(
+                        lambda _index: attempt(),
+                        range(8),
+                    )
+                )
+
+        successes = [
+            value
+            for status, value in results
+            if status == "ok"
+        ]
+
+        failures = [
+            value
+            for status, value in results
+            if status == "error"
+        ]
+
+        self.assertEqual(
+            len(successes),
+            1,
+        )
+
+        self.assertEqual(
+            len(failures),
+            7,
+        )
+
+        self.assertEqual(
+            registry._consumed_execution_bindings,
+            {successes[0].binding_id},
+        )
+
+    def test_phase6db_stale_binding_fails_without_consumption(
+        self,
+    ):
+        (
+            registry,
+            record,
+            request,
+            _challenge,
+            evidence,
+            _revalidation,
+            _snapshot,
+            at,
+        ) = self._phase6da_success(
+            request_id="PHASE6DB-STALE"
+        )
+
+        binding = auth.build_trusted_execution_binding(
+            registry=registry,
+            approval_id=evidence.approval_id,
+            request=request,
+            record=record,
+        )
+
+        with patch(
+            "sanitization_authorization._utc_now",
+            return_value=at + timedelta(seconds=400),
+        ):
+            with self.assertRaisesRegex(
+                auth.OneShotExecutionGateError,
+                "stale",
+            ):
+                auth.satisfy_one_shot_execution_gate(
+                    registry=registry,
+                    approval_id=evidence.approval_id,
+                    request=request,
+                    record=record,
+                )
+
+        self.assertNotIn(
+            binding.binding_id,
+            registry._consumed_execution_bindings,
+        )
+
+    def test_phase6db_clock_rollback_fails_without_consumption(
+        self,
+    ):
+        (
+            registry,
+            record,
+            request,
+            _challenge,
+            evidence,
+            _revalidation,
+            _snapshot,
+            at,
+        ) = self._phase6da_success(
+            request_id="PHASE6DB-ROLLBACK"
+        )
+
+        binding = auth.build_trusted_execution_binding(
+            registry=registry,
+            approval_id=evidence.approval_id,
+            request=request,
+            record=record,
+        )
+
+        with patch(
+            "sanitization_authorization._utc_now",
+            return_value=at - timedelta(seconds=30),
+        ):
+            with self.assertRaisesRegex(
+                auth.OneShotExecutionGateError,
+                "rolled back",
+            ):
+                auth.satisfy_one_shot_execution_gate(
+                    registry=registry,
+                    approval_id=evidence.approval_id,
+                    request=request,
+                    record=record,
+                )
+
+        self.assertNotIn(
+            binding.binding_id,
+            registry._consumed_execution_bindings,
+        )
+
+    def test_phase6db_rechecks_currentness_after_lock_acquisition(
+        self,
+    ):
+        (
+            registry,
+            record,
+            request,
+            _challenge,
+            evidence,
+            _revalidation,
+            _snapshot,
+            at,
+        ) = self._phase6da_success(
+            request_id="PHASE6DB-LOCK-TIME"
+        )
+
+        binding = auth.build_trusted_execution_binding(
+            registry=registry,
+            approval_id=evidence.approval_id,
+            request=request,
+            record=record,
+        )
+
+        with patch(
+            "sanitization_authorization._utc_now",
+            side_effect=(
+                at + timedelta(seconds=2),
+                at + timedelta(seconds=400),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                auth.OneShotExecutionGateError,
+                "expired before atomic consumption",
+            ):
+                auth.satisfy_one_shot_execution_gate(
+                    registry=registry,
+                    approval_id=evidence.approval_id,
+                    request=request,
+                    record=record,
+                )
+
+        self.assertNotIn(
+            binding.binding_id,
+            registry._consumed_execution_bindings,
+        )
+
+    def test_phase6db_rejects_changed_request_or_record(
+        self,
+    ):
+        (
+            registry,
+            record,
+            request,
+            _challenge,
+            evidence,
+            _revalidation,
+            _snapshot,
+            at,
+        ) = self._phase6da_success(
+            request_id="PHASE6DB-IDENTITY"
+        )
+
+        changed_request = replace(
+            request,
+            operation="sanitize ",
+        )
+
+        changed_record = replace(
+            record,
+            intended_action="changed",
+        )
+
+        for candidate_request, candidate_record in (
+            (changed_request, record),
+            (request, changed_record),
+        ):
+            with self.subTest(
+                request=candidate_request,
+                record=candidate_record,
+            ):
+                with patch(
+                    "sanitization_authorization._utc_now",
+                    return_value=at + timedelta(seconds=2),
+                ):
+                    with self.assertRaises(
+                        auth.OneShotExecutionGateError
+                    ):
+                        auth.satisfy_one_shot_execution_gate(
+                            registry=registry,
+                            approval_id=evidence.approval_id,
+                            request=candidate_request,
+                            record=candidate_record,
+                        )
+
+        self.assertEqual(
+            registry._consumed_execution_bindings,
+            set(),
+        )
+
+    def test_phase6db_rejects_registry_provenance_tampering(
+        self,
+    ):
+        (
+            registry,
+            record,
+            request,
+            _challenge,
+            evidence,
+            _revalidation,
+            _snapshot,
+            at,
+        ) = self._phase6da_success(
+            request_id="PHASE6DB-PROVENANCE"
+        )
+
+        registry._successful_revalidations.pop(
+            evidence.approval_id
+        )
+
+        with patch(
+            "sanitization_authorization._utc_now",
+            return_value=at + timedelta(seconds=2),
+        ):
+            with self.assertRaises(
+                auth.OneShotExecutionGateError
+            ):
+                auth.satisfy_one_shot_execution_gate(
+                    registry=registry,
+                    approval_id=evidence.approval_id,
+                    request=request,
+                    record=record,
+                )
+
+        self.assertEqual(
+            registry._consumed_execution_bindings,
+            set(),
+        )
+
+    def test_phase6db_gate_integrity_detects_tampering(
+        self,
+    ):
+        (
+            registry,
+            record,
+            request,
+            _challenge,
+            evidence,
+            _revalidation,
+            _snapshot,
+            at,
+        ) = self._phase6da_success(
+            request_id="PHASE6DB-INTEGRITY"
+        )
+
+        with patch(
+            "sanitization_authorization._utc_now",
+            return_value=at + timedelta(seconds=2),
+        ):
+            gate = auth.satisfy_one_shot_execution_gate(
+                registry=registry,
+                approval_id=evidence.approval_id,
+                request=request,
+                record=record,
+            )
+
+        self.assertTrue(
+            auth._one_shot_execution_gate_integrity_valid(
+                gate
+            )
+        )
+
+        cases = (
+            replace(
+                gate,
+                status="other",
+            ),
+            replace(
+                gate,
+                binding_id="xeb_" + ("0" * 64),
+            ),
+            replace(
+                gate,
+                target_binding_hash=(
+                    "sha256:" + ("1" * 64)
+                ),
+            ),
+            replace(
+                gate,
+                operation="other",
+            ),
+            replace(
+                gate,
+                gate_id="xgate_" + ("2" * 64),
+            ),
+            replace(
+                gate,
+                evaluated_at_utc=(
+                    gate.prerequisite_valid_until_utc
+                    .replace("Z", "")
+                    + "Z"
+                ),
+                gate_id="xgate_" + ("3" * 64),
+            ),
+        )
+
+        for candidate in cases:
+            with self.subTest(candidate=candidate):
+                self.assertFalse(
+                    auth._one_shot_execution_gate_integrity_valid(
+                        candidate
+                    )
+                )
+
+    def test_phase6db_surface_is_non_executing_and_registry_api_unchanged(
+        self,
+    ):
+        public_methods = {
+            name
+            for name, value
+            in inspect.getmembers(
+                auth.ApprovalRegistry,
+                predicate=inspect.isfunction,
+            )
+            if not name.startswith("_")
+        }
+
+        self.assertEqual(
+            public_methods,
+            {
+                "create_challenge",
+                "record_human_approval",
+                "revalidate_approval",
+            },
+        )
+
+        signature = inspect.signature(
+            auth.satisfy_one_shot_execution_gate
+        )
+
+        self.assertEqual(
+            tuple(signature.parameters),
+            (
+                "registry",
+                "approval_id",
+                "request",
+                "record",
+            ),
+        )
+
+        field_names = {
+            field.name
+            for field in fields(
+                auth.OneShotExecutionGateDecision
+            )
+        }
+
+        for forbidden in (
+            "approved",
+            "authorized",
+            "command",
+            "executable",
+            "executor",
+            "callback",
+            "device_handle",
+            "argv",
+            "arguments",
+            "shell",
+            "success",
+            "wipe",
+        ):
+            self.assertNotIn(
+                forbidden,
+                field_names,
+            )
+
+        source = inspect.getsource(
+            auth.satisfy_one_shot_execution_gate
+        )
+
+        for forbidden in (
+            "collect_current_drive_discovery",
+            "record_human_approval(",
+            "revalidate_approval(",
+            "subprocess",
+            "os.system",
+            "Popen",
+            "shell=True",
+            "exec(",
+            "eval(",
+            "open(",
+            "write_text",
+            "write_bytes",
+            "unlink",
+            "remove(",
+        ):
+            self.assertNotIn(
+                forbidden,
+                source,
+            )
+
 if __name__ == "__main__":
     unittest.main()
