@@ -358,10 +358,27 @@ CSV_FIELDS = [
     "sanitization_method", "sanitization_result", "sanitization_failure_error", "sanitization_start_timestamp",
     "sanitization_end_timestamp", "verification_required", "verification_method", "verification_result",
     "verification_failure_details", "verification_timestamp", "final_status", "final_disposition",
-    "disposition_timestamp", "disposition_classification", "batch_intake_status",
+    "disposition_timestamp", "disposition_classification", "sanitization_measurements_json", "evidence_hashes_json", "batch_intake_status",
     "batch_intake_review_notes", "drive_intake_status", "drive_intake_review_notes",
 ]
 
+
+def _csv_json_object(
+    value: Dict[str, Any],
+    name: str,
+) -> str:
+    try:
+        return json.dumps(
+            value,
+            sort_keys=True,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError) as exc:
+        raise MalformedRecordError(
+            f"{name} must contain JSON-compatible values"
+        ) from exc
 
 def save_json(batch: BatchRecord, path: os.PathLike[str] | str) -> None:
     """Validate and durably create a new authoritative JSON record."""
@@ -397,6 +414,14 @@ def export_csv(batch: BatchRecord, path: os.PathLike[str] | str) -> None:
         row = {name: batch_values.get(name) for name in CSV_FIELDS}
         drive_values = asdict(drive)
         row.update({name: drive_values.get(name) for name in CSV_FIELDS if name in drive_values})
+        row["sanitization_measurements_json"] = _csv_json_object(
+            drive.sanitization_measurements,
+            "sanitization_measurements",
+        )
+        row["evidence_hashes_json"] = _csv_json_object(
+            drive.evidence_hashes,
+            "evidence_hashes",
+        )
         row.update({
             "batch_intake_status": batch.intake_status,
             "batch_intake_review_notes": batch.intake_review_notes,

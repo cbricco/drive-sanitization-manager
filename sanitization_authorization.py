@@ -1597,6 +1597,253 @@ def run_synthetic_sanitization_plan(
 
     return result
 
+SYNTHETIC_RUN_EVIDENCE_ORIGIN = (
+    "phase6c-b-synthetic-memory-v1"
+)
+
+
+_SYNTHETIC_RUN_MEASUREMENT_KEYS = (
+    "synthetic_evidence_origin",
+    "synthetic_run_mode",
+    "synthetic_run_status",
+    "synthetic_plan_id",
+    "synthetic_run_id",
+    "synthetic_method_profile_id",
+    "synthetic_operation",
+    "synthetic_target_id",
+    "synthetic_bytes_processed",
+)
+
+
+_SYNTHETIC_RUN_EVIDENCE_HASH_KEYS = (
+    "synthetic_plan_hash",
+    "synthetic_constraint_evaluation_hash",
+    "synthetic_target_binding_hash",
+    "synthetic_input_payload_hash",
+    "synthetic_output_payload_hash",
+    "synthetic_run_result_hash",
+)
+
+
+class SyntheticRunEvidenceIntegrationError(
+    AuthorizationError
+):
+    """Synthetic evidence could not be bound to a record safely."""
+
+
+def build_drive_record_with_synthetic_run_evidence(
+    *,
+    record: Any,
+    plan: Any,
+    result: Any,
+) -> DriveRecord:
+    """Return a copied DriveRecord containing synthetic-run evidence.
+
+    This function does not mutate the supplied record and does not mark
+    sanitization, verification, or final disposition as successful.
+    It performs no discovery, execution, approval, filesystem, or device
+    operation.
+    """
+
+    if not isinstance(record, DriveRecord):
+        raise SyntheticRunEvidenceIntegrationError(
+            "record is invalid"
+        )
+
+    try:
+        record.validate()
+    except RecordError as exc:
+        raise SyntheticRunEvidenceIntegrationError(
+            "record validation failed"
+        ) from exc
+
+    if (
+        record.sanitization_status != "not_started"
+        or record.sanitization_result is not None
+        or record.verification_result != "not_performed"
+        or record.final_status != "pending"
+    ):
+        raise SyntheticRunEvidenceIntegrationError(
+            "record already carries outcome state"
+        )
+
+    if not isinstance(
+        plan,
+        SyntheticSanitizationPlan,
+    ):
+        raise SyntheticRunEvidenceIntegrationError(
+            "plan is invalid"
+        )
+
+    if not _synthetic_sanitization_plan_integrity_valid(
+        plan
+    ):
+        raise SyntheticRunEvidenceIntegrationError(
+            "plan integrity is invalid"
+        )
+
+    if not isinstance(
+        result,
+        SyntheticSanitizationRunResult,
+    ):
+        raise SyntheticRunEvidenceIntegrationError(
+            "synthetic run result is invalid"
+        )
+
+    if not (
+        _synthetic_sanitization_run_result_integrity_valid(
+            result
+        )
+    ):
+        raise SyntheticRunEvidenceIntegrationError(
+            "synthetic run result integrity is invalid"
+        )
+
+    policy = get_sanitization_method_policy(
+        plan.method_profile_id
+    )
+
+    metadata = (
+        get_sanitization_method_capability_metadata(
+            plan.method_profile_id
+        )
+    )
+
+    if policy is None or metadata is None:
+        raise SyntheticRunEvidenceIntegrationError(
+            "trusted method metadata is unavailable"
+        )
+
+    if (
+        policy.method_profile_id
+        != plan.method_profile_id
+        or metadata.method_profile_id
+        != plan.method_profile_id
+        or policy.operation != plan.operation
+        or policy.policy_only is not True
+        or policy.execution_supported is not False
+        or metadata.capability_class != "policy_only"
+    ):
+        raise SyntheticRunEvidenceIntegrationError(
+            "plan is outside synthetic evidence policy"
+        )
+
+    if (
+        result.plan_id != plan.plan_id
+        or result.plan_hash != plan.plan_hash
+        or result.method_profile_id
+        != plan.method_profile_id
+        or result.operation != plan.operation
+        or result.synthetic_target_id
+        != plan.synthetic_target_id
+        or result.target_binding_hash
+        != plan.target_binding_hash
+        or result.constraint_evaluation_hash
+        != plan.constraint_evaluation_hash
+    ):
+        raise SyntheticRunEvidenceIntegrationError(
+            "synthetic run result does not match plan"
+        )
+
+    if (
+        not _synthetic_target_id_valid(
+            record.linux_device_path
+        )
+        or record.linux_device_path
+        != plan.synthetic_target_id
+    ):
+        raise SyntheticRunEvidenceIntegrationError(
+            "drive record does not match synthetic target"
+        )
+
+    if any(
+        key in record.sanitization_measurements
+        for key in _SYNTHETIC_RUN_MEASUREMENT_KEYS
+    ):
+        raise SyntheticRunEvidenceIntegrationError(
+            "synthetic measurement evidence already exists"
+        )
+
+    if any(
+        key in record.evidence_hashes
+        for key in _SYNTHETIC_RUN_EVIDENCE_HASH_KEYS
+    ):
+        raise SyntheticRunEvidenceIntegrationError(
+            "synthetic hash evidence already exists"
+        )
+
+    values = asdict(record)
+
+    measurements = dict(
+        record.sanitization_measurements
+    )
+
+    measurements.update({
+        "synthetic_evidence_origin":
+            SYNTHETIC_RUN_EVIDENCE_ORIGIN,
+        "synthetic_run_mode":
+            result.run_mode,
+        "synthetic_run_status":
+            result.status,
+        "synthetic_plan_id":
+            result.plan_id,
+        "synthetic_run_id":
+            result.run_id,
+        "synthetic_method_profile_id":
+            result.method_profile_id,
+        "synthetic_operation":
+            result.operation,
+        "synthetic_target_id":
+            result.synthetic_target_id,
+        "synthetic_bytes_processed":
+            result.bytes_processed,
+    })
+
+    hashes = dict(
+        record.evidence_hashes
+    )
+
+    hashes.update({
+        "synthetic_plan_hash":
+            result.plan_hash,
+        "synthetic_constraint_evaluation_hash":
+            result.constraint_evaluation_hash,
+        "synthetic_target_binding_hash":
+            result.target_binding_hash,
+        "synthetic_input_payload_hash":
+            result.input_payload_hash,
+        "synthetic_output_payload_hash":
+            result.output_payload_hash,
+        "synthetic_run_result_hash":
+            result.result_hash,
+    })
+
+    values["sanitization_measurements"] = (
+        measurements
+    )
+
+    values["evidence_hashes"] = hashes
+
+    integrated = DriveRecord.from_dict(
+        values
+    )
+
+    if (
+        integrated.sanitization_status
+        != record.sanitization_status
+        or integrated.sanitization_result
+        != record.sanitization_result
+        or integrated.verification_result
+        != record.verification_result
+        or integrated.final_status
+        != record.final_status
+    ):
+        raise SyntheticRunEvidenceIntegrationError(
+            "synthetic evidence changed outcome state"
+        )
+
+    return integrated
+
 
 def _contains_forbidden_control(value: str) -> bool:
     return any(
@@ -4077,6 +4324,8 @@ __all__ = [
     "SyntheticSanitizationMemoryTarget",
     "SyntheticSanitizationRunResult",
     "SyntheticSanitizationRunError",
+    "SyntheticRunEvidenceIntegrationError",
+    "SYNTHETIC_RUN_EVIDENCE_ORIGIN",
     "SYNTHETIC_SANITIZATION_RUN_SCHEMA_VERSION",
     "SYNTHETIC_SANITIZATION_RUN_MODE",
     "SYNTHETIC_SANITIZATION_RUN_STATUS_COMPLETED",
@@ -4106,6 +4355,7 @@ __all__ = [
     "evaluate_sanitization_method_constraints",
     "build_synthetic_sanitization_plan",
     "run_synthetic_sanitization_plan",
+    "build_drive_record_with_synthetic_run_evidence",
     "record_snapshot_hash",
     "request_hash",
 ]

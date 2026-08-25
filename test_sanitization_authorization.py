@@ -6556,5 +6556,322 @@ class Phase5AuthorizationR2Tests(unittest.TestCase):
                 source,
             )
 
+    def test_phase6cc_integrates_synthetic_evidence_without_claiming_success(
+        self,
+    ):
+        _, _, plan, target = self._phase6cb_fixture(
+            payload=b"synthetic evidence"
+        )
+
+        result = auth.run_synthetic_sanitization_plan(
+            plan=plan,
+            target=target,
+        )
+
+        record = DriveRecord(
+            internal_record_id="DRV-6CC-A",
+            batch_job_id="JOB-6CC",
+            linux_device_path="synthetic://drive-a",
+        )
+
+        integrated = (
+            auth.build_drive_record_with_synthetic_run_evidence(
+                record=record,
+                plan=plan,
+                result=result,
+            )
+        )
+
+        self.assertEqual(
+            integrated.sanitization_status,
+            "not_started",
+        )
+        self.assertIsNone(
+            integrated.sanitization_result
+        )
+        self.assertEqual(
+            integrated.verification_result,
+            "not_performed",
+        )
+        self.assertEqual(
+            integrated.final_status,
+            "pending",
+        )
+
+        self.assertEqual(
+            integrated.sanitization_measurements,
+            {
+                "synthetic_evidence_origin":
+                    auth.SYNTHETIC_RUN_EVIDENCE_ORIGIN,
+                "synthetic_run_mode":
+                    result.run_mode,
+                "synthetic_run_status":
+                    result.status,
+                "synthetic_plan_id":
+                    result.plan_id,
+                "synthetic_run_id":
+                    result.run_id,
+                "synthetic_method_profile_id":
+                    result.method_profile_id,
+                "synthetic_operation":
+                    result.operation,
+                "synthetic_target_id":
+                    result.synthetic_target_id,
+                "synthetic_bytes_processed":
+                    result.bytes_processed,
+            },
+        )
+
+        self.assertEqual(
+            integrated.evidence_hashes,
+            {
+                "synthetic_plan_hash":
+                    result.plan_hash,
+                "synthetic_constraint_evaluation_hash":
+                    result.constraint_evaluation_hash,
+                "synthetic_target_binding_hash":
+                    result.target_binding_hash,
+                "synthetic_input_payload_hash":
+                    result.input_payload_hash,
+                "synthetic_output_payload_hash":
+                    result.output_payload_hash,
+                "synthetic_run_result_hash":
+                    result.result_hash,
+            },
+        )
+
+    def test_phase6cc_integration_is_deterministic_and_preserves_original(
+        self,
+    ):
+        _, _, plan, target = self._phase6cb_fixture()
+
+        result = auth.run_synthetic_sanitization_plan(
+            plan=plan,
+            target=target,
+        )
+
+        record = DriveRecord(
+            internal_record_id="DRV-6CC-B",
+            batch_job_id="JOB-6CC",
+            linux_device_path="synthetic://drive-a",
+            sanitization_measurements={
+                "preexisting": "keep",
+            },
+            evidence_hashes={
+                "preexisting_hash":
+                    "sha256:preexisting",
+            },
+        )
+
+        first = (
+            auth.build_drive_record_with_synthetic_run_evidence(
+                record=record,
+                plan=plan,
+                result=result,
+            )
+        )
+
+        second = (
+            auth.build_drive_record_with_synthetic_run_evidence(
+                record=record,
+                plan=plan,
+                result=result,
+            )
+        )
+
+        self.assertEqual(first, second)
+        self.assertIsNot(first, record)
+
+        self.assertEqual(
+            record.sanitization_measurements,
+            {"preexisting": "keep"},
+        )
+
+        self.assertEqual(
+            record.evidence_hashes,
+            {
+                "preexisting_hash":
+                    "sha256:preexisting"
+            },
+        )
+
+        self.assertEqual(
+            first.sanitization_measurements[
+                "preexisting"
+            ],
+            "keep",
+        )
+
+        self.assertEqual(
+            first.evidence_hashes[
+                "preexisting_hash"
+            ],
+            "sha256:preexisting",
+        )
+
+    def test_phase6cc_rejects_record_target_or_result_binding_mismatch(
+        self,
+    ):
+        _, _, plan, target = self._phase6cb_fixture()
+
+        result = auth.run_synthetic_sanitization_plan(
+            plan=plan,
+            target=target,
+        )
+
+        wrong_record = DriveRecord(
+            internal_record_id="DRV-6CC-C",
+            batch_job_id="JOB-6CC",
+            linux_device_path="synthetic://drive-b",
+        )
+
+        with self.assertRaises(
+            auth.SyntheticRunEvidenceIntegrationError
+        ):
+            auth.build_drive_record_with_synthetic_run_evidence(
+                record=wrong_record,
+                plan=plan,
+                result=result,
+            )
+
+        matching_record = DriveRecord(
+            internal_record_id="DRV-6CC-D",
+            batch_job_id="JOB-6CC",
+            linux_device_path="synthetic://drive-a",
+        )
+
+        tampered = replace(
+            result,
+            result_hash="sha256:" + ("0" * 64),
+        )
+
+        with self.assertRaises(
+            auth.SyntheticRunEvidenceIntegrationError
+        ):
+            auth.build_drive_record_with_synthetic_run_evidence(
+                record=matching_record,
+                plan=plan,
+                result=tampered,
+            )
+
+    def test_phase6cc_rejects_record_with_existing_outcome_state(
+        self,
+    ):
+        _, _, plan, target = self._phase6cb_fixture()
+
+        result = auth.run_synthetic_sanitization_plan(
+            plan=plan,
+            target=target,
+        )
+
+        base = DriveRecord(
+            internal_record_id="DRV-6CC-E",
+            batch_job_id="JOB-6CC",
+            linux_device_path="synthetic://drive-a",
+        )
+
+        cases = (
+            replace(
+                base,
+                sanitization_status="succeeded",
+            ),
+            replace(
+                base,
+                sanitization_result="claimed result",
+            ),
+            replace(
+                base,
+                verification_result="passed",
+            ),
+            replace(
+                base,
+                final_status="complete",
+            ),
+        )
+
+        for record in cases:
+            with self.subTest(record=record):
+                with self.assertRaises(
+                    auth.SyntheticRunEvidenceIntegrationError
+                ):
+                    auth.build_drive_record_with_synthetic_run_evidence(
+                        record=record,
+                        plan=plan,
+                        result=result,
+                    )
+
+    def test_phase6cc_rejects_reserved_synthetic_evidence_collision(
+        self,
+    ):
+        _, _, plan, target = self._phase6cb_fixture()
+
+        result = auth.run_synthetic_sanitization_plan(
+            plan=plan,
+            target=target,
+        )
+
+        measurement_collision = DriveRecord(
+            internal_record_id="DRV-6CC-F",
+            batch_job_id="JOB-6CC",
+            linux_device_path="synthetic://drive-a",
+            sanitization_measurements={
+                "synthetic_run_id": "existing",
+            },
+        )
+
+        hash_collision = DriveRecord(
+            internal_record_id="DRV-6CC-G",
+            batch_job_id="JOB-6CC",
+            linux_device_path="synthetic://drive-a",
+            evidence_hashes={
+                "synthetic_plan_hash":
+                    "sha256:existing",
+            },
+        )
+
+        for record in (
+            measurement_collision,
+            hash_collision,
+        ):
+            with self.subTest(record=record):
+                with self.assertRaises(
+                    auth.SyntheticRunEvidenceIntegrationError
+                ):
+                    auth.build_drive_record_with_synthetic_run_evidence(
+                        record=record,
+                        plan=plan,
+                        result=result,
+                    )
+
+    def test_phase6cc_integration_surface_has_no_execution_or_io(
+        self,
+    ):
+        source = inspect.getsource(
+            auth.build_drive_record_with_synthetic_run_evidence
+        )
+
+        for forbidden in (
+            "subprocess",
+            "os.system",
+            "Popen",
+            "shell=True",
+            "exec(",
+            "eval(",
+            "open(",
+            "collect_current_drive_discovery",
+            "ApprovalRegistry",
+            "record_human_approval",
+            "revalidate_approval",
+            "write_text",
+            "write_bytes",
+            "unlink",
+            "remove(",
+            "/dev/",
+        ):
+            self.assertNotIn(
+                forbidden,
+                source,
+            )
+
 if __name__ == "__main__":
     unittest.main()

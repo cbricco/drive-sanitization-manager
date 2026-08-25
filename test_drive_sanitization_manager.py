@@ -207,6 +207,122 @@ class RecordsFoundationTests(unittest.TestCase):
         self.assertEqual(rows[0]["batch_intake_status"], "in_progress")
         self.assertEqual(rows[0]["drive_intake_status"], "review_needed")
 
+    def test_csv_reports_measurements_and_evidence_hashes_as_json(
+        self,
+    ):
+        batch = self.make_batch()
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "evidence.csv"
+
+            export_csv(batch, path)
+
+            with path.open(
+                encoding="utf-8-sig",
+                newline="",
+            ) as stream:
+                rows = list(
+                    csv.DictReader(stream)
+                )
+
+        self.assertIn(
+            "sanitization_measurements_json",
+            rows[0],
+        )
+
+        self.assertIn(
+            "evidence_hashes_json",
+            rows[0],
+        )
+
+        self.assertEqual(
+            json.loads(
+                rows[0][
+                    "sanitization_measurements_json"
+                ]
+            ),
+            batch.drives[0].sanitization_measurements,
+        )
+
+        self.assertEqual(
+            json.loads(
+                rows[0][
+                    "evidence_hashes_json"
+                ]
+            ),
+            batch.drives[0].evidence_hashes,
+        )
+
+    def test_csv_evidence_json_is_deterministic_and_empty_objects_are_preserved(
+        self,
+    ):
+        batch = self.make_batch()
+
+        batch.drives[0].sanitization_measurements = {
+            "zeta": 3,
+            "alpha": 1,
+        }
+
+        batch.drives[0].evidence_hashes = {
+            "zeta_hash": "sha256:z",
+            "alpha_hash": "sha256:a",
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "deterministic.csv"
+
+            export_csv(batch, path)
+
+            with path.open(
+                encoding="utf-8-sig",
+                newline="",
+            ) as stream:
+                rows = list(
+                    csv.DictReader(stream)
+                )
+
+        self.assertEqual(
+            rows[0]["sanitization_measurements_json"],
+            '{"alpha":1,"zeta":3}',
+        )
+
+        self.assertEqual(
+            rows[0]["evidence_hashes_json"],
+            '{"alpha_hash":"sha256:a","zeta_hash":"sha256:z"}',
+        )
+
+        self.assertEqual(
+            rows[1]["sanitization_measurements_json"],
+            "{}",
+        )
+
+        self.assertEqual(
+            rows[1]["evidence_hashes_json"],
+            "{}",
+        )
+
+    def test_csv_rejects_non_json_evidence_without_creating_output(
+        self,
+    ):
+        batch = self.make_batch()
+
+        batch.drives[0].sanitization_measurements = {
+            "bad": object(),
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "must-not-exist.csv"
+
+            with self.assertRaisesRegex(
+                MalformedRecordError,
+                "JSON-compatible",
+            ):
+                export_csv(batch, path)
+
+            self.assertFalse(
+                path.exists()
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
