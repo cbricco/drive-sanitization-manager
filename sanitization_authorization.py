@@ -781,6 +781,376 @@ def evaluate_sanitization_method_constraints(
         reason_codes=reason_codes,
     )
 
+SYNTHETIC_SANITIZATION_PLAN_SCHEMA_VERSION = 1
+SYNTHETIC_SANITIZATION_PLAN_MODE = "synthetic_only"
+
+
+class SyntheticSanitizationPlanError(AuthorizationError):
+    """Synthetic plan input could not be bound safely."""
+
+
+@dataclass(frozen=True)
+class SyntheticSanitizationPlan:
+    """Inert, deterministic synthetic sanitization plan.
+
+    This object contains no command, executable, callback, device handle,
+    approval authority, or execution authority.  It cannot target a real
+    operating-system device path.
+    """
+
+    plan_id: str
+    schema_version: int
+    plan_mode: str
+    method_profile_id: str
+    operation: str
+    synthetic_target_id: str
+    target_binding_hash: str
+    constraint_evaluation_hash: str
+    plan_hash: str
+
+
+def _synthetic_plan_exact_text(
+    value: Any,
+) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and value == value.strip()
+        and not any(
+            ord(character) < 32
+            or ord(character) == 127
+            for character in value
+        )
+    )
+
+
+def _synthetic_target_id_valid(
+    value: Any,
+) -> bool:
+    if not _synthetic_plan_exact_text(value):
+        return False
+
+    prefix = "synthetic://"
+
+    if not value.startswith(prefix):
+        return False
+
+    identifier = value[len(prefix):]
+
+    return (
+        bool(identifier)
+        and identifier not in {".", ".."}
+        and all(
+            character.isalnum()
+            or character in "-_."
+            for character in identifier
+        )
+    )
+
+
+def _synthetic_plan_hash_value(
+    value: Any,
+) -> bool:
+    if (
+        not isinstance(value, str)
+        or not value.startswith("sha256:")
+        or len(value) != len("sha256:") + 64
+    ):
+        return False
+
+    suffix = value[len("sha256:"):]
+
+    return all(
+        character in "0123456789abcdef"
+        for character in suffix
+    )
+
+
+def _synthetic_sanitization_plan_payload(
+    *,
+    schema_version: int,
+    plan_mode: str,
+    method_profile_id: str,
+    operation: str,
+    synthetic_target_id: str,
+    target_binding_hash: str,
+    constraint_evaluation_hash: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": schema_version,
+        "plan_mode": plan_mode,
+        "method_profile_id": method_profile_id,
+        "operation": operation,
+        "synthetic_target_id": synthetic_target_id,
+        "target_binding_hash": target_binding_hash,
+        "constraint_evaluation_hash": (
+            constraint_evaluation_hash
+        ),
+    }
+
+
+def _synthetic_sanitization_plan_integrity_valid(
+    plan: Any,
+) -> bool:
+    try:
+        if not isinstance(
+            plan,
+            SyntheticSanitizationPlan,
+        ):
+            return False
+
+        if (
+            type(plan.schema_version) is not int
+            or plan.schema_version
+            != SYNTHETIC_SANITIZATION_PLAN_SCHEMA_VERSION
+            or plan.plan_mode
+            != SYNTHETIC_SANITIZATION_PLAN_MODE
+        ):
+            return False
+
+        if not _synthetic_plan_exact_text(
+            plan.method_profile_id
+        ):
+            return False
+
+        if not _synthetic_plan_exact_text(
+            plan.operation
+        ):
+            return False
+
+        if not _synthetic_target_id_valid(
+            plan.synthetic_target_id
+        ):
+            return False
+
+        if not _synthetic_plan_hash_value(
+            plan.target_binding_hash
+        ):
+            return False
+
+        if not _synthetic_plan_hash_value(
+            plan.constraint_evaluation_hash
+        ):
+            return False
+
+        if not _synthetic_plan_hash_value(
+            plan.plan_hash
+        ):
+            return False
+
+        payload = (
+            _synthetic_sanitization_plan_payload(
+                schema_version=plan.schema_version,
+                plan_mode=plan.plan_mode,
+                method_profile_id=plan.method_profile_id,
+                operation=plan.operation,
+                synthetic_target_id=(
+                    plan.synthetic_target_id
+                ),
+                target_binding_hash=(
+                    plan.target_binding_hash
+                ),
+                constraint_evaluation_hash=(
+                    plan.constraint_evaluation_hash
+                ),
+            )
+        )
+
+        expected_hash = _canonical_hash(payload)
+
+        expected_id = (
+            "splan_"
+            + expected_hash.split(":", 1)[1]
+        )
+
+        return (
+            plan.plan_hash == expected_hash
+            and plan.plan_id == expected_id
+        )
+    except Exception:
+        return False
+
+
+def build_synthetic_sanitization_plan(
+    *,
+    method_profile_id: Any,
+    operation: Any,
+    synthetic_target_id: Any,
+    target_binding: Any,
+    constraint_evaluation: Any,
+) -> SyntheticSanitizationPlan:
+    """Build one inert synthetic-only plan.
+
+    The supplied constraint result is independently recomputed and must
+    match exactly.  This function performs no discovery, approval,
+    execution, command construction, filesystem access, or device access.
+    """
+
+    if not _synthetic_plan_exact_text(
+        method_profile_id
+    ):
+        raise SyntheticSanitizationPlanError(
+            "method_profile_id is invalid"
+        )
+
+    if not _synthetic_plan_exact_text(
+        operation
+    ):
+        raise SyntheticSanitizationPlanError(
+            "operation is invalid"
+        )
+
+    policy = get_sanitization_method_policy(
+        method_profile_id
+    )
+
+    metadata = (
+        get_sanitization_method_capability_metadata(
+            method_profile_id
+        )
+    )
+
+    if policy is None or metadata is None:
+        raise SyntheticSanitizationPlanError(
+            "trusted method metadata is unavailable"
+        )
+
+    if (
+        policy.method_profile_id
+        != method_profile_id
+        or metadata.method_profile_id
+        != method_profile_id
+        or policy.operation != operation
+    ):
+        raise SyntheticSanitizationPlanError(
+            "method policy binding mismatch"
+        )
+
+    if (
+        policy.policy_only is not True
+        or policy.execution_supported is not False
+        or metadata.capability_class != "policy_only"
+    ):
+        raise SyntheticSanitizationPlanError(
+            "method is outside synthetic-plan policy"
+        )
+
+    if not _synthetic_target_id_valid(
+        synthetic_target_id
+    ):
+        raise SyntheticSanitizationPlanError(
+            "synthetic_target_id is invalid"
+        )
+
+    if not (
+        _sanitization_method_constraint_target_binding_valid(
+            target_binding
+        )
+    ):
+        raise SyntheticSanitizationPlanError(
+            "target binding is invalid"
+        )
+
+    if target_binding.path != synthetic_target_id:
+        raise SyntheticSanitizationPlanError(
+            "target binding is not the exact synthetic target"
+        )
+
+    if not isinstance(
+        constraint_evaluation,
+        SanitizationMethodConstraintEvaluation,
+    ):
+        raise SyntheticSanitizationPlanError(
+            "constraint evaluation is invalid"
+        )
+
+    recomputed = (
+        evaluate_sanitization_method_constraints(
+            method_profile_id,
+            target_binding,
+        )
+    )
+
+    if constraint_evaluation != recomputed:
+        raise SyntheticSanitizationPlanError(
+            "constraint evaluation does not match recomputation"
+        )
+
+    if (
+        constraint_evaluation.method_profile_id
+        != method_profile_id
+        or constraint_evaluation.status
+        != METHOD_CONSTRAINT_STATUS_SATISFIED
+        or constraint_evaluation.reason_codes != ()
+        or constraint_evaluation.target_binding_hash
+        is None
+    ):
+        raise SyntheticSanitizationPlanError(
+            "method constraints are not satisfied"
+        )
+
+    target_binding_hash = _canonical_hash(
+        asdict(target_binding)
+    )
+
+    if (
+        constraint_evaluation.target_binding_hash
+        != target_binding_hash
+    ):
+        raise SyntheticSanitizationPlanError(
+            "constraint target binding hash mismatch"
+        )
+
+    constraint_evaluation_hash = _canonical_hash(
+        asdict(constraint_evaluation)
+    )
+
+    payload = (
+        _synthetic_sanitization_plan_payload(
+            schema_version=(
+                SYNTHETIC_SANITIZATION_PLAN_SCHEMA_VERSION
+            ),
+            plan_mode=SYNTHETIC_SANITIZATION_PLAN_MODE,
+            method_profile_id=method_profile_id,
+            operation=operation,
+            synthetic_target_id=synthetic_target_id,
+            target_binding_hash=target_binding_hash,
+            constraint_evaluation_hash=(
+                constraint_evaluation_hash
+            ),
+        )
+    )
+
+    plan_hash = _canonical_hash(payload)
+
+    plan = SyntheticSanitizationPlan(
+        plan_id=(
+            "splan_"
+            + plan_hash.split(":", 1)[1]
+        ),
+        schema_version=(
+            SYNTHETIC_SANITIZATION_PLAN_SCHEMA_VERSION
+        ),
+        plan_mode=SYNTHETIC_SANITIZATION_PLAN_MODE,
+        method_profile_id=method_profile_id,
+        operation=operation,
+        synthetic_target_id=synthetic_target_id,
+        target_binding_hash=target_binding_hash,
+        constraint_evaluation_hash=(
+            constraint_evaluation_hash
+        ),
+        plan_hash=plan_hash,
+    )
+
+    if not _synthetic_sanitization_plan_integrity_valid(
+        plan
+    ):
+        raise SyntheticSanitizationPlanError(
+            "constructed synthetic plan failed integrity validation"
+        )
+
+    return plan
+
 
 def _contains_forbidden_control(value: str) -> bool:
     return any(
@@ -3254,6 +3624,10 @@ __all__ = [
     "SanitizationMethodPolicy",
     "SanitizationMethodCapabilityMetadata",
     "SanitizationMethodConstraintEvaluation",
+    "SyntheticSanitizationPlan",
+    "SyntheticSanitizationPlanError",
+    "SYNTHETIC_SANITIZATION_PLAN_SCHEMA_VERSION",
+    "SYNTHETIC_SANITIZATION_PLAN_MODE",
     "METHOD_CONSTRAINT_STATUS_SATISFIED",
     "METHOD_CONSTRAINT_STATUS_REVIEW_REQUIRED",
     "METHOD_CONSTRAINT_STATUS_REFUSED",
@@ -3277,6 +3651,7 @@ __all__ = [
     "get_sanitization_method_policy",
     "get_sanitization_method_capability_metadata",
     "evaluate_sanitization_method_constraints",
+    "build_synthetic_sanitization_plan",
     "record_snapshot_hash",
     "request_hash",
 ]

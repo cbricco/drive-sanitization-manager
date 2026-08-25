@@ -5442,5 +5442,625 @@ class Phase5AuthorizationR2Tests(unittest.TestCase):
                 source,
             )
 
+    def test_phase6ca_builds_exact_frozen_deterministic_synthetic_plan(
+        self,
+    ):
+        binding = auth.TargetIdentityBinding(
+            path="synthetic://drive-a",
+            serial="SERIAL-A",
+            wwn="WWN-A",
+            size_bytes=1_000_000,
+            model="Synthetic Model",
+            transport="synthetic",
+            read_only=False,
+            mounted=False,
+            protected=False,
+            system_protected=False,
+            review_required=False,
+            ambiguous=False,
+        )
+
+        constraints = (
+            auth.evaluate_sanitization_method_constraints(
+                "phase5-policy-only",
+                binding,
+            )
+        )
+
+        first = auth.build_synthetic_sanitization_plan(
+            method_profile_id="phase5-policy-only",
+            operation="sanitize",
+            synthetic_target_id="synthetic://drive-a",
+            target_binding=binding,
+            constraint_evaluation=constraints,
+        )
+
+        second = auth.build_synthetic_sanitization_plan(
+            method_profile_id="phase5-policy-only",
+            operation="sanitize",
+            synthetic_target_id="synthetic://drive-a",
+            target_binding=binding,
+            constraint_evaluation=constraints,
+        )
+
+        self.assertEqual(first, second)
+
+        self.assertEqual(
+            first.plan_mode,
+            auth.SYNTHETIC_SANITIZATION_PLAN_MODE,
+        )
+
+        self.assertEqual(
+            first.schema_version,
+            auth.SYNTHETIC_SANITIZATION_PLAN_SCHEMA_VERSION,
+        )
+
+        self.assertEqual(
+            first.method_profile_id,
+            "phase5-policy-only",
+        )
+
+        self.assertEqual(
+            first.operation,
+            "sanitize",
+        )
+
+        self.assertEqual(
+            first.synthetic_target_id,
+            "synthetic://drive-a",
+        )
+
+        self.assertEqual(
+            first.target_binding_hash,
+            constraints.target_binding_hash,
+        )
+
+        self.assertTrue(
+            first.plan_id.startswith("splan_")
+        )
+
+        self.assertTrue(
+            first.plan_hash.startswith("sha256:")
+        )
+
+        self.assertTrue(
+            auth._synthetic_sanitization_plan_integrity_valid(
+                first
+            )
+        )
+
+        with self.assertRaises(FrozenInstanceError):
+            first.operation = "other"
+
+    def test_phase6ca_rejects_real_or_malformed_target_namespace(
+        self,
+    ):
+        safe_binding = auth.TargetIdentityBinding(
+            path="synthetic://drive-a",
+            serial="SERIAL-A",
+            wwn="WWN-A",
+            size_bytes=1_000_000,
+            model="Synthetic Model",
+            transport="synthetic",
+            read_only=False,
+            mounted=False,
+            protected=False,
+            system_protected=False,
+            review_required=False,
+            ambiguous=False,
+        )
+
+        safe_constraints = (
+            auth.evaluate_sanitization_method_constraints(
+                "phase5-policy-only",
+                safe_binding,
+            )
+        )
+
+        invalid_ids = (
+            "/dev/sda",
+            "/tmp/fake-drive",
+            "file:///tmp/fake-drive",
+            "synthetic://",
+            "synthetic://drive/a",
+            "synthetic://drive a",
+            "synthetic://drive-a ",
+            " synthetic://drive-a",
+            "SYNTHETIC://drive-a",
+            "synthetic://..",
+        )
+
+        for synthetic_target_id in invalid_ids:
+            with self.subTest(
+                synthetic_target_id=synthetic_target_id
+            ):
+                with self.assertRaises(
+                    auth.SyntheticSanitizationPlanError
+                ):
+                    auth.build_synthetic_sanitization_plan(
+                        method_profile_id=(
+                            "phase5-policy-only"
+                        ),
+                        operation="sanitize",
+                        synthetic_target_id=(
+                            synthetic_target_id
+                        ),
+                        target_binding=safe_binding,
+                        constraint_evaluation=(
+                            safe_constraints
+                        ),
+                    )
+
+        real_binding = replace(
+            safe_binding,
+            path="/dev/sda",
+        )
+
+        real_constraints = (
+            auth.evaluate_sanitization_method_constraints(
+                "phase5-policy-only",
+                real_binding,
+            )
+        )
+
+        self.assertEqual(
+            real_constraints.status,
+            auth.METHOD_CONSTRAINT_STATUS_SATISFIED,
+        )
+
+        with self.assertRaises(
+            auth.SyntheticSanitizationPlanError
+        ):
+            auth.build_synthetic_sanitization_plan(
+                method_profile_id="phase5-policy-only",
+                operation="sanitize",
+                synthetic_target_id="/dev/sda",
+                target_binding=real_binding,
+                constraint_evaluation=real_constraints,
+            )
+
+    def test_phase6ca_requires_exact_target_binding_to_synthetic_id(
+        self,
+    ):
+        binding = auth.TargetIdentityBinding(
+            path="synthetic://drive-a",
+            serial="SERIAL-A",
+            wwn="WWN-A",
+            size_bytes=1_000_000,
+            model="Synthetic Model",
+            transport="synthetic",
+            read_only=False,
+            mounted=False,
+            protected=False,
+            system_protected=False,
+            review_required=False,
+            ambiguous=False,
+        )
+
+        constraints = (
+            auth.evaluate_sanitization_method_constraints(
+                "phase5-policy-only",
+                binding,
+            )
+        )
+
+        with self.assertRaises(
+            auth.SyntheticSanitizationPlanError
+        ):
+            auth.build_synthetic_sanitization_plan(
+                method_profile_id="phase5-policy-only",
+                operation="sanitize",
+                synthetic_target_id="synthetic://drive-b",
+                target_binding=binding,
+                constraint_evaluation=constraints,
+            )
+
+        changed_binding = replace(
+            binding,
+            path="synthetic://drive-b",
+        )
+
+        changed_constraints = (
+            auth.evaluate_sanitization_method_constraints(
+                "phase5-policy-only",
+                changed_binding,
+            )
+        )
+
+        first = auth.build_synthetic_sanitization_plan(
+            method_profile_id="phase5-policy-only",
+            operation="sanitize",
+            synthetic_target_id="synthetic://drive-a",
+            target_binding=binding,
+            constraint_evaluation=constraints,
+        )
+
+        second = auth.build_synthetic_sanitization_plan(
+            method_profile_id="phase5-policy-only",
+            operation="sanitize",
+            synthetic_target_id="synthetic://drive-b",
+            target_binding=changed_binding,
+            constraint_evaluation=changed_constraints,
+        )
+
+        self.assertNotEqual(
+            first.target_binding_hash,
+            second.target_binding_hash,
+        )
+
+        self.assertNotEqual(
+            first.plan_hash,
+            second.plan_hash,
+        )
+
+        self.assertNotEqual(
+            first.plan_id,
+            second.plan_id,
+        )
+
+    def test_phase6ca_recomputes_and_requires_exact_constraint_result(
+        self,
+    ):
+        binding = auth.TargetIdentityBinding(
+            path="synthetic://drive-a",
+            serial="SERIAL-A",
+            wwn="WWN-A",
+            size_bytes=1_000_000,
+            model="Synthetic Model",
+            transport="synthetic",
+            read_only=False,
+            mounted=False,
+            protected=False,
+            system_protected=False,
+            review_required=False,
+            ambiguous=False,
+        )
+
+        constraints = (
+            auth.evaluate_sanitization_method_constraints(
+                "phase5-policy-only",
+                binding,
+            )
+        )
+
+        forged_hash = replace(
+            constraints,
+            target_binding_hash=(
+                "sha256:" + ("0" * 64)
+            ),
+        )
+
+        with self.assertRaises(
+            auth.SyntheticSanitizationPlanError
+        ):
+            auth.build_synthetic_sanitization_plan(
+                method_profile_id="phase5-policy-only",
+                operation="sanitize",
+                synthetic_target_id="synthetic://drive-a",
+                target_binding=binding,
+                constraint_evaluation=forged_hash,
+            )
+
+        forged_status = replace(
+            constraints,
+            status=(
+                auth.METHOD_CONSTRAINT_STATUS_REFUSED
+            ),
+        )
+
+        with self.assertRaises(
+            auth.SyntheticSanitizationPlanError
+        ):
+            auth.build_synthetic_sanitization_plan(
+                method_profile_id="phase5-policy-only",
+                operation="sanitize",
+                synthetic_target_id="synthetic://drive-a",
+                target_binding=binding,
+                constraint_evaluation=forged_status,
+            )
+
+    def test_phase6ca_rejects_unsatisfied_constraint_results(
+        self,
+    ):
+        safe = auth.TargetIdentityBinding(
+            path="synthetic://drive-a",
+            serial="SERIAL-A",
+            wwn="WWN-A",
+            size_bytes=1_000_000,
+            model="Synthetic Model",
+            transport="synthetic",
+            read_only=False,
+            mounted=False,
+            protected=False,
+            system_protected=False,
+            review_required=False,
+            ambiguous=False,
+        )
+
+        unsafe_bindings = (
+            replace(
+                safe,
+                mounted=True,
+            ),
+            replace(
+                safe,
+                read_only=True,
+            ),
+            replace(
+                safe,
+                protected=True,
+            ),
+            replace(
+                safe,
+                system_protected=True,
+            ),
+            replace(
+                safe,
+                ambiguous=True,
+            ),
+            replace(
+                safe,
+                review_required=True,
+            ),
+            replace(
+                safe,
+                serial=None,
+                wwn=None,
+            ),
+        )
+
+        for binding in unsafe_bindings:
+            with self.subTest(binding=binding):
+                constraints = (
+                    auth.evaluate_sanitization_method_constraints(
+                        "phase5-policy-only",
+                        binding,
+                    )
+                )
+
+                self.assertNotEqual(
+                    constraints.status,
+                    auth.METHOD_CONSTRAINT_STATUS_SATISFIED,
+                )
+
+                with self.assertRaises(
+                    auth.SyntheticSanitizationPlanError
+                ):
+                    auth.build_synthetic_sanitization_plan(
+                        method_profile_id=(
+                            "phase5-policy-only"
+                        ),
+                        operation="sanitize",
+                        synthetic_target_id=(
+                            "synthetic://drive-a"
+                        ),
+                        target_binding=binding,
+                        constraint_evaluation=constraints,
+                    )
+
+    def test_phase6ca_requires_exact_method_and_operation_binding(
+        self,
+    ):
+        binding = auth.TargetIdentityBinding(
+            path="synthetic://drive-a",
+            serial="SERIAL-A",
+            wwn="WWN-A",
+            size_bytes=1_000_000,
+            model="Synthetic Model",
+            transport="synthetic",
+            read_only=False,
+            mounted=False,
+            protected=False,
+            system_protected=False,
+            review_required=False,
+            ambiguous=False,
+        )
+
+        constraints = (
+            auth.evaluate_sanitization_method_constraints(
+                "phase5-policy-only",
+                binding,
+            )
+        )
+
+        cases = (
+            (
+                "phase5-policy-only ",
+                "sanitize",
+            ),
+            (
+                " phase5-policy-only",
+                "sanitize",
+            ),
+            (
+                "PHASE5-POLICY-ONLY",
+                "sanitize",
+            ),
+            (
+                "unknown",
+                "sanitize",
+            ),
+            (
+                "phase5-policy-only",
+                "sanitize ",
+            ),
+            (
+                "phase5-policy-only",
+                " sanitize",
+            ),
+            (
+                "phase5-policy-only",
+                "SANITIZE",
+            ),
+        )
+
+        for method_profile_id, operation in cases:
+            with self.subTest(
+                method_profile_id=method_profile_id,
+                operation=operation,
+            ):
+                with self.assertRaises(
+                    auth.SyntheticSanitizationPlanError
+                ):
+                    auth.build_synthetic_sanitization_plan(
+                        method_profile_id=(
+                            method_profile_id
+                        ),
+                        operation=operation,
+                        synthetic_target_id=(
+                            "synthetic://drive-a"
+                        ),
+                        target_binding=binding,
+                        constraint_evaluation=constraints,
+                    )
+
+    def test_phase6ca_plan_integrity_detects_tampering(
+        self,
+    ):
+        binding = auth.TargetIdentityBinding(
+            path="synthetic://drive-a",
+            serial="SERIAL-A",
+            wwn="WWN-A",
+            size_bytes=1_000_000,
+            model="Synthetic Model",
+            transport="synthetic",
+            read_only=False,
+            mounted=False,
+            protected=False,
+            system_protected=False,
+            review_required=False,
+            ambiguous=False,
+        )
+
+        constraints = (
+            auth.evaluate_sanitization_method_constraints(
+                "phase5-policy-only",
+                binding,
+            )
+        )
+
+        plan = auth.build_synthetic_sanitization_plan(
+            method_profile_id="phase5-policy-only",
+            operation="sanitize",
+            synthetic_target_id="synthetic://drive-a",
+            target_binding=binding,
+            constraint_evaluation=constraints,
+        )
+
+        self.assertTrue(
+            auth._synthetic_sanitization_plan_integrity_valid(
+                plan
+            )
+        )
+
+        tampered = (
+            replace(
+                plan,
+                operation="other",
+            ),
+            replace(
+                plan,
+                synthetic_target_id="synthetic://drive-b",
+            ),
+            replace(
+                plan,
+                target_binding_hash=(
+                    "sha256:" + ("0" * 64)
+                ),
+            ),
+            replace(
+                plan,
+                constraint_evaluation_hash=(
+                    "sha256:" + ("1" * 64)
+                ),
+            ),
+            replace(
+                plan,
+                plan_hash=(
+                    "sha256:" + ("2" * 64)
+                ),
+            ),
+            replace(
+                plan,
+                plan_id="splan_" + ("3" * 64),
+            ),
+        )
+
+        for candidate in tampered:
+            with self.subTest(candidate=candidate):
+                self.assertFalse(
+                    auth._synthetic_sanitization_plan_integrity_valid(
+                        candidate
+                    )
+                )
+
+    def test_phase6ca_plan_surface_contains_no_executor_or_approval_authority(
+        self,
+    ):
+        field_names = {
+            field.name
+            for field in fields(
+                auth.SyntheticSanitizationPlan
+            )
+        }
+
+        expected = {
+            "plan_id",
+            "schema_version",
+            "plan_mode",
+            "method_profile_id",
+            "operation",
+            "synthetic_target_id",
+            "target_binding_hash",
+            "constraint_evaluation_hash",
+            "plan_hash",
+        }
+
+        self.assertEqual(
+            field_names,
+            expected,
+        )
+
+        for forbidden in (
+            "approved",
+            "authorized",
+            "command",
+            "executable",
+            "callback",
+            "executor",
+            "device_handle",
+            "argv",
+            "arguments",
+            "shell",
+            "result",
+            "success",
+        ):
+            self.assertNotIn(
+                forbidden,
+                field_names,
+            )
+
+        source = inspect.getsource(
+            auth.build_synthetic_sanitization_plan
+        )
+
+        for forbidden in (
+            "subprocess",
+            "os.system",
+            "Popen",
+            "shell=True",
+            "exec(",
+            "eval(",
+            "collect_current_drive_discovery",
+            "ApprovalRegistry",
+            "record_human_approval",
+            "revalidate_approval",
+            "open(",
+        ):
+            self.assertNotIn(
+                forbidden,
+                source,
+            )
+
 if __name__ == "__main__":
     unittest.main()
