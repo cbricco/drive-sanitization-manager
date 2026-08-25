@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 import inspect
 import json
 import unittest
+import sanitization_authorization as auth
 from unittest.mock import patch
 
 from drive_discovery import (
@@ -1970,6 +1971,2370 @@ class Phase5AuthorizationR2Tests(unittest.TestCase):
                     )
                 )
 
+
+    def _phase6a2_request(
+        self,
+        record,
+        *,
+        request_id="PHASE6A2-REQ",
+        at=None,
+    ):
+        if at is None:
+            at = datetime(
+                2026, 8, 23, 9, 59, 0,
+                tzinfo=timezone.utc,
+            )
+
+        with patch(
+            "sanitization_authorization._utc_now",
+            return_value=at,
+        ):
+            return auth.build_authorization_request(
+                record,
+                request_id=request_id,
+                operation="sanitize",
+                method_profile_id="phase5-policy-only",
+            )
+
+    def _phase6a2_create_challenge(
+        self,
+        *,
+        registry=None,
+        record=None,
+        snapshot=None,
+        at=None,
+        request_id="PHASE6A2-REQ",
+    ):
+        if registry is None:
+            registry = auth.ApprovalRegistry()
+
+        if record is None:
+            record = self.record()
+
+        if snapshot is None:
+            snapshot = self.snapshot()
+
+        if at is None:
+            at = datetime(
+                2026, 8, 23, 10, 0, 0,
+                tzinfo=timezone.utc,
+            )
+
+        request = self._phase6a2_request(
+            record,
+            request_id=request_id,
+            at=at - timedelta(seconds=60),
+        )
+
+        with (
+            patch(
+                "sanitization_authorization."
+                "collect_current_drive_discovery",
+                return_value=snapshot,
+            ),
+            patch(
+                "sanitization_authorization._utc_now",
+                return_value=at,
+            ),
+        ):
+            challenge = registry.create_challenge(
+                request,
+                record,
+            )
+
+        return (
+            registry,
+            record,
+            request,
+            challenge,
+            snapshot,
+            at,
+        )
+
+    def _phase6a2_start_approval(
+        self,
+        *,
+        registry=None,
+        record=None,
+        snapshot=None,
+        at=None,
+        request_id="PHASE6A2-REQ",
+    ):
+        (
+            registry,
+            record,
+            request,
+            challenge,
+            snapshot,
+            at,
+        ) = self._phase6a2_create_challenge(
+            registry=registry,
+            record=record,
+            snapshot=snapshot,
+            at=at,
+            request_id=request_id,
+        )
+
+        with patch(
+            "sanitization_authorization._utc_now",
+            return_value=at,
+        ):
+            evidence = (
+                registry.record_human_approval(
+                    challenge.challenge_id
+                )
+            )
+
+        return (
+            registry,
+            record,
+            request,
+            challenge,
+            evidence,
+            snapshot,
+            at,
+        )
+
+    def _phase6a2_revalidate(
+        self,
+        registry,
+        evidence,
+        request,
+        record,
+        snapshot,
+        *,
+        at,
+    ):
+        with (
+            patch(
+                "sanitization_authorization."
+                "collect_current_drive_discovery",
+                return_value=snapshot,
+            ),
+            patch(
+                "sanitization_authorization._utc_now",
+                return_value=at,
+            ),
+        ):
+            return registry.revalidate_approval(
+                evidence.approval_id,
+                request,
+                record,
+            )
+
+    def test_approval_registry_public_surface_has_no_decision_or_boolean_authority(
+        self,
+    ):
+        create_params = inspect.signature(
+            auth.ApprovalRegistry.create_challenge
+        ).parameters
+
+        approval_params = inspect.signature(
+            auth.ApprovalRegistry.record_human_approval
+        ).parameters
+
+        revalidate_params = inspect.signature(
+            auth.ApprovalRegistry.revalidate_approval
+        ).parameters
+
+        self.assertEqual(
+            tuple(create_params),
+            ("self", "request", "record"),
+        )
+
+        self.assertEqual(
+            tuple(approval_params),
+            ("self", "challenge_id"),
+        )
+
+        self.assertEqual(
+            tuple(revalidate_params),
+            (
+                "self",
+                "approval_id",
+                "request",
+                "record",
+            ),
+        )
+
+        for params in (
+            create_params,
+            approval_params,
+            revalidate_params,
+        ):
+            for forbidden in (
+                "decision",
+                "current_decision",
+                "approved",
+                "approval_evidence",
+                "now",
+                "nonce",
+            ):
+                self.assertNotIn(
+                    forbidden,
+                    params,
+                )
+
+    def test_create_challenge_uses_fresh_internal_positive_evaluation(
+        self,
+    ):
+        record = self.record()
+        snapshot = self.snapshot()
+
+        at = datetime(
+            2026, 8, 23, 10, 0, 0,
+            tzinfo=timezone.utc,
+        )
+
+        request = self._phase6a2_request(
+            record,
+            at=at - timedelta(seconds=60),
+        )
+
+        registry = auth.ApprovalRegistry()
+
+        original = (
+            auth.evaluate_current_authorization_prerequisites
+        )
+
+        with (
+            patch(
+                "sanitization_authorization."
+                "collect_current_drive_discovery",
+                return_value=snapshot,
+            ),
+            patch(
+                "sanitization_authorization._utc_now",
+                return_value=at,
+            ),
+            patch(
+                "sanitization_authorization."
+                "evaluate_current_authorization_prerequisites",
+                wraps=original,
+            ) as evaluator,
+        ):
+            challenge = registry.create_challenge(
+                request,
+                record,
+            )
+
+        self.assertEqual(
+            evaluator.call_count,
+            1,
+        )
+
+        self.assertTrue(
+            auth._approval_challenge_integrity_valid(
+                challenge
+            )
+        )
+
+    def test_create_challenge_rejects_nonpositive_target(
+        self,
+    ):
+        mounted_snapshot = self.snapshot([
+            self.device(
+                mountpoints=[
+                    "/mnt/phase6a2"
+                ]
+            )
+        ])
+
+        with self.assertRaises(
+            auth.ApprovalError
+        ):
+            self._phase6a2_create_challenge(
+                snapshot=mounted_snapshot
+            )
+
+    def test_challenge_creation_rejects_post_evaluation_clock_rollback(
+        self,
+    ):
+        record = self.record()
+        snapshot = self.snapshot()
+
+        at = datetime(
+            2026, 8, 23, 10, 0, 0,
+            tzinfo=timezone.utc,
+        )
+
+        request = self._phase6a2_request(
+            record,
+            at=at - timedelta(seconds=60),
+        )
+
+        registry = auth.ApprovalRegistry()
+
+        with (
+            patch(
+                "sanitization_authorization."
+                "collect_current_drive_discovery",
+                return_value=snapshot,
+            ),
+            patch(
+                "sanitization_authorization._utc_now",
+                side_effect=[
+                    at,
+                    at,
+                    at,
+                    at - timedelta(seconds=6),
+                ],
+            ),
+            self.assertRaises(
+                auth.ApprovalError
+            ),
+        ):
+            registry.create_challenge(
+                request,
+                record,
+            )
+
+    def test_expired_challenge_cannot_be_approved(
+        self,
+    ):
+        (
+            registry,
+            _record,
+            _request,
+            challenge,
+            _snapshot,
+            at,
+        ) = self._phase6a2_create_challenge()
+
+        with (
+            patch(
+                "sanitization_authorization._utc_now",
+                return_value=(
+                    at
+                    + timedelta(
+                        seconds=(
+                            auth.APPROVAL_CHALLENGE_LIFETIME_SECONDS
+                            + 1
+                        )
+                    )
+                ),
+            ),
+            self.assertRaises(
+                auth.ApprovalError
+            ),
+        ):
+            registry.record_human_approval(
+                challenge.challenge_id
+            )
+
+    def test_challenge_can_be_approved_only_once(
+        self,
+    ):
+        (
+            registry,
+            _record,
+            _request,
+            challenge,
+            _snapshot,
+            at,
+        ) = self._phase6a2_create_challenge()
+
+        with patch(
+            "sanitization_authorization._utc_now",
+            return_value=at,
+        ):
+            evidence = (
+                registry.record_human_approval(
+                    challenge.challenge_id
+                )
+            )
+
+        self.assertTrue(
+            auth._approval_evidence_integrity_valid(
+                evidence
+            )
+        )
+
+        with (
+            patch(
+                "sanitization_authorization._utc_now",
+                return_value=at,
+            ),
+            self.assertRaises(
+                auth.ApprovalError
+            ),
+        ):
+            registry.record_human_approval(
+                challenge.challenge_id
+            )
+
+    def test_exact_approval_flow_revalidates_fresh_state(
+        self,
+    ):
+        (
+            registry,
+            record,
+            request,
+            challenge,
+            evidence,
+            snapshot,
+            at,
+        ) = self._phase6a2_start_approval()
+
+        result = self._phase6a2_revalidate(
+            registry,
+            evidence,
+            request,
+            record,
+            snapshot,
+            at=at + timedelta(seconds=1),
+        )
+
+        self.assertEqual(
+            result.status,
+            auth.APPROVAL_STATUS_REVALIDATED,
+        )
+
+        self.assertEqual(
+            result.reason_codes,
+            (),
+        )
+
+        self.assertEqual(
+            result.approval_id,
+            evidence.approval_id,
+        )
+
+        self.assertEqual(
+            result.challenge_id,
+            challenge.challenge_id,
+        )
+
+        self.assertEqual(
+            result.original_target_binding_hash,
+            result.fresh_target_binding_hash,
+        )
+
+        self.assertNotEqual(
+            result.original_prerequisite_decision_id,
+            result.fresh_prerequisite_decision_id,
+        )
+
+    def test_revalidation_can_be_attempted_only_once(
+        self,
+    ):
+        (
+            registry,
+            record,
+            request,
+            _challenge,
+            evidence,
+            snapshot,
+            at,
+        ) = self._phase6a2_start_approval()
+
+        first = self._phase6a2_revalidate(
+            registry,
+            evidence,
+            request,
+            record,
+            snapshot,
+            at=at + timedelta(seconds=1),
+        )
+
+        second = self._phase6a2_revalidate(
+            registry,
+            evidence,
+            request,
+            record,
+            snapshot,
+            at=at + timedelta(seconds=2),
+        )
+
+        self.assertEqual(
+            first.status,
+            auth.APPROVAL_STATUS_REVALIDATED,
+        )
+
+        self.assertEqual(
+            second.reason_codes,
+            (
+                "APPROVAL_ALREADY_CONSUMED",
+            ),
+        )
+
+    def test_expired_approval_fails_closed_and_is_consumed(
+        self,
+    ):
+        (
+            registry,
+            record,
+            request,
+            _challenge,
+            evidence,
+            snapshot,
+            at,
+        ) = self._phase6a2_start_approval()
+
+        expired = self._phase6a2_revalidate(
+            registry,
+            evidence,
+            request,
+            record,
+            snapshot,
+            at=(
+                at
+                + timedelta(
+                    seconds=(
+                        auth.APPROVAL_REVALIDATION_WINDOW_SECONDS
+                        + 1
+                    )
+                )
+            ),
+        )
+
+        self.assertEqual(
+            expired.reason_codes,
+            ("APPROVAL_EXPIRED",),
+        )
+
+        second = self._phase6a2_revalidate(
+            registry,
+            evidence,
+            request,
+            record,
+            snapshot,
+            at=at + timedelta(seconds=2),
+        )
+
+        self.assertEqual(
+            second.reason_codes,
+            (
+                "APPROVAL_ALREADY_CONSUMED",
+            ),
+        )
+
+    def test_failed_revalidation_is_consumed(
+        self,
+    ):
+        (
+            registry,
+            record,
+            request,
+            _challenge,
+            evidence,
+            _snapshot,
+            at,
+        ) = self._phase6a2_start_approval()
+
+        unsafe_snapshot = self.snapshot([
+            self.device(
+                mountpoints=[
+                    "/mnt/phase6a2"
+                ]
+            )
+        ])
+
+        failed = self._phase6a2_revalidate(
+            registry,
+            evidence,
+            request,
+            record,
+            unsafe_snapshot,
+            at=at + timedelta(seconds=1),
+        )
+
+        self.assertEqual(
+            failed.status,
+            auth.APPROVAL_STATUS_REVALIDATION_FAILED,
+        )
+
+        second = self._phase6a2_revalidate(
+            registry,
+            evidence,
+            request,
+            record,
+            self.snapshot(),
+            at=at + timedelta(seconds=2),
+        )
+
+        self.assertEqual(
+            second.reason_codes,
+            (
+                "APPROVAL_ALREADY_CONSUMED",
+            ),
+        )
+
+    def test_record_mutation_after_challenge_fails_revalidation(
+        self,
+    ):
+        (
+            registry,
+            record,
+            request,
+            _challenge,
+            evidence,
+            snapshot,
+            at,
+        ) = self._phase6a2_start_approval()
+
+        changed_record = replace(
+            record,
+            intended_action="different-action",
+        )
+
+        result = self._phase6a2_revalidate(
+            registry,
+            evidence,
+            request,
+            changed_record,
+            snapshot,
+            at=at + timedelta(seconds=1),
+        )
+
+        self.assertEqual(
+            result.status,
+            auth.APPROVAL_STATUS_REVALIDATION_FAILED,
+        )
+
+    def test_path_change_with_same_identity_fails_revalidation(
+        self,
+    ):
+        (
+            registry,
+            record,
+            request,
+            _challenge,
+            evidence,
+            _snapshot,
+            at,
+        ) = self._phase6a2_start_approval()
+
+        moved_snapshot = self.snapshot([
+            self.device(
+                path="/dev/phase6a2-other"
+            )
+        ])
+
+        result = self._phase6a2_revalidate(
+            registry,
+            evidence,
+            request,
+            record,
+            moved_snapshot,
+            at=at + timedelta(seconds=1),
+        )
+
+        self.assertEqual(
+            result.status,
+            auth.APPROVAL_STATUS_REVALIDATION_FAILED,
+        )
+
+    def test_strong_identity_change_fails_revalidation(
+        self,
+    ):
+        (
+            registry,
+            record,
+            request,
+            _challenge,
+            evidence,
+            _snapshot,
+            at,
+        ) = self._phase6a2_start_approval()
+
+        changed_snapshot = self.snapshot([
+            self.device(
+                serial=(
+                    "PHASE6A2-OTHER-SERIAL"
+                ),
+                wwn=(
+                    "PHASE6A2-OTHER-WWN"
+                ),
+            )
+        ])
+
+        result = self._phase6a2_revalidate(
+            registry,
+            evidence,
+            request,
+            record,
+            changed_snapshot,
+            at=at + timedelta(seconds=1),
+        )
+
+        self.assertEqual(
+            result.status,
+            auth.APPROVAL_STATUS_REVALIDATION_FAILED,
+        )
+
+    def test_raw_unsafe_discovery_states_fail_revalidation(
+        self,
+    ):
+        def read_only_snapshot():
+            return self.snapshot([
+                self.device(
+                    read_only=True
+                )
+            ])
+
+        def mounted_snapshot():
+            return self.snapshot([
+                self.device(
+                    mountpoints=[
+                        "/mnt/phase6a2"
+                    ]
+                )
+            ])
+
+        def protected_snapshot():
+            return self.snapshot(
+                protected_sources=(
+                    "/dev/syn-a",
+                )
+            )
+
+        def duplicate_identity_snapshot():
+            return self.snapshot([
+                self.device(),
+                self.device(
+                    path="/dev/syn-b",
+                    serial="SERIAL-A",
+                    wwn="WWN-B",
+                ),
+            ])
+
+        cases = (
+            (
+                "read_only",
+                read_only_snapshot,
+            ),
+            (
+                "mounted",
+                mounted_snapshot,
+            ),
+            (
+                "protected",
+                protected_snapshot,
+            ),
+            (
+                "duplicate_identity",
+                duplicate_identity_snapshot,
+            ),
+        )
+
+        for label, make_snapshot in cases:
+            with self.subTest(label=label):
+                (
+                    registry,
+                    record,
+                    request,
+                    _challenge,
+                    evidence,
+                    _snapshot,
+                    at,
+                ) = (
+                    self._phase6a2_start_approval(
+                        request_id=(
+                            "PHASE6A2-RAW-"
+                            + label.upper()
+                        )
+                    )
+                )
+
+                result = (
+                    self._phase6a2_revalidate(
+                        registry,
+                        evidence,
+                        request,
+                        record,
+                        make_snapshot(),
+                        at=(
+                            at
+                            + timedelta(
+                                seconds=1
+                            )
+                        ),
+                    )
+                )
+
+                self.assertEqual(
+                    result.status,
+                    auth.APPROVAL_STATUS_REVALIDATION_FAILED,
+                )
+
+                self.assertTrue(
+                    result.reason_codes
+                )
+
+    def test_discovery_collection_failure_fails_revalidation(
+        self,
+    ):
+        (
+            registry,
+            record,
+            request,
+            _challenge,
+            evidence,
+            _snapshot,
+            at,
+        ) = self._phase6a2_start_approval()
+
+        with (
+            patch(
+                "sanitization_authorization."
+                "collect_current_drive_discovery",
+                side_effect=(
+                    auth.DiscoveryCollectionError(
+                        "synthetic collection failure"
+                    )
+                ),
+            ),
+            patch(
+                "sanitization_authorization._utc_now",
+                return_value=(
+                    at + timedelta(seconds=1)
+                ),
+            ),
+        ):
+            result = registry.revalidate_approval(
+                evidence.approval_id,
+                request,
+                record,
+            )
+
+        self.assertEqual(
+            result.status,
+            auth.APPROVAL_STATUS_REVALIDATION_FAILED,
+        )
+
+    def test_clock_rollback_fails_approval_and_revalidation(
+        self,
+    ):
+        (
+            registry,
+            _record,
+            _request,
+            challenge,
+            _snapshot,
+            at,
+        ) = self._phase6a2_create_challenge()
+
+        with (
+            patch(
+                "sanitization_authorization._utc_now",
+                return_value=(
+                    at - timedelta(seconds=6)
+                ),
+            ),
+            self.assertRaises(
+                auth.ApprovalError
+            ),
+        ):
+            registry.record_human_approval(
+                challenge.challenge_id
+            )
+
+        (
+            registry,
+            record,
+            request,
+            _challenge,
+            evidence,
+            snapshot,
+            at,
+        ) = self._phase6a2_start_approval(
+            request_id=(
+                "PHASE6A2-ROLLBACK-REVALIDATION"
+            )
+        )
+
+        result = self._phase6a2_revalidate(
+            registry,
+            evidence,
+            request,
+            record,
+            snapshot,
+            at=at - timedelta(seconds=6),
+        )
+
+        self.assertEqual(
+            result.reason_codes,
+            ("APPROVAL_CLOCK_INVALID",),
+        )
+
+    def test_fresh_evaluation_clock_rollback_after_valid_revalidation_start_fails(
+        self,
+    ):
+        (
+            registry,
+            record,
+            request,
+            _challenge,
+            evidence,
+            snapshot,
+            at,
+        ) = self._phase6a2_start_approval(
+            request_id="PHASE6A2-FRESH-ROLLBACK"
+        )
+
+        with (
+            patch(
+                "sanitization_authorization."
+                "collect_current_drive_discovery",
+                return_value=snapshot,
+            ),
+            patch(
+                "sanitization_authorization._utc_now",
+                side_effect=[
+                    at + timedelta(seconds=1),
+                    at - timedelta(seconds=10),
+                    at - timedelta(seconds=10),
+                ],
+            ),
+        ):
+            result = registry.revalidate_approval(
+                evidence.approval_id,
+                request,
+                record,
+            )
+
+        self.assertEqual(
+            result.status,
+            auth.APPROVAL_STATUS_REVALIDATION_FAILED,
+        )
+
+        self.assertEqual(
+            result.reason_codes,
+            ("FRESH_CLOCK_INVALID",),
+        )
+
+    def test_fabricated_approval_evidence_object_is_not_trusted(
+        self,
+    ):
+        (
+            registry,
+            record,
+            request,
+            _challenge,
+            evidence,
+            _snapshot,
+            at,
+        ) = self._phase6a2_start_approval()
+
+        fabricated = replace(
+            evidence,
+            approval_id="appr_fabricated",
+        )
+
+        with patch(
+            "sanitization_authorization._utc_now",
+            return_value=at + timedelta(seconds=1),
+        ):
+            malformed = registry.revalidate_approval(
+                fabricated,
+                request,
+                record,
+            )
+
+        self.assertEqual(
+            malformed.reason_codes,
+            ("APPROVAL_ID_INVALID",),
+        )
+
+        with patch(
+            "sanitization_authorization._utc_now",
+            return_value=at + timedelta(seconds=1),
+        ):
+            unknown = registry.revalidate_approval(
+                fabricated.approval_id,
+                request,
+                record,
+            )
+
+        self.assertEqual(
+            unknown.reason_codes,
+            ("APPROVAL_UNKNOWN",),
+        )
+
+    def test_new_registry_has_no_old_approval_state(
+        self,
+    ):
+        (
+            _registry,
+            record,
+            request,
+            _challenge,
+            evidence,
+            _snapshot,
+            at,
+        ) = self._phase6a2_start_approval()
+
+        new_registry = auth.ApprovalRegistry()
+
+        with patch(
+            "sanitization_authorization._utc_now",
+            return_value=at + timedelta(seconds=1),
+        ):
+            result = new_registry.revalidate_approval(
+                evidence.approval_id,
+                request,
+                record,
+            )
+
+        self.assertEqual(
+            result.reason_codes,
+            ("APPROVAL_UNKNOWN",),
+        )
+
+    def test_approval_models_are_frozen(
+        self,
+    ):
+        (
+            registry,
+            record,
+            request,
+            challenge,
+            evidence,
+            snapshot,
+            at,
+        ) = self._phase6a2_start_approval()
+
+        result = self._phase6a2_revalidate(
+            registry,
+            evidence,
+            request,
+            record,
+            snapshot,
+            at=at + timedelta(seconds=1),
+        )
+
+        for value in (
+            challenge,
+            evidence,
+            result,
+        ):
+            with self.subTest(
+                model=type(value).__name__
+            ):
+                with self.assertRaises(
+                    FrozenInstanceError
+                ):
+                    value.schema_version = 999
+
+    def test_no_executor_or_destructive_authority_surface(
+        self,
+    ):
+        registry_methods = {
+            name
+            for name, value
+            in inspect.getmembers(
+                auth.ApprovalRegistry,
+                predicate=inspect.isfunction,
+            )
+            if not name.startswith("_")
+        }
+
+        self.assertEqual(
+            registry_methods,
+            {
+                "create_challenge",
+                "record_human_approval",
+                "revalidate_approval",
+            },
+        )
+
+        forbidden_fields = {
+            "approved",
+            "authorized",
+            "execute",
+            "executor",
+            "ready_to_wipe",
+            "safe_to_wipe",
+        }
+
+        for model in (
+            auth.ApprovalChallenge,
+            auth.HumanApprovalEvidence,
+            auth.ApprovalRevalidationDecision,
+        ):
+            self.assertTrue(
+                forbidden_fields.isdisjoint(
+                    {
+                        field.name
+                        for field in fields(model)
+                    }
+                )
+            )
+
+    def test_stale_fresh_evaluation_fails_revalidation(
+        self,
+    ):
+        (
+            registry,
+            record,
+            request,
+            _challenge,
+            evidence,
+            snapshot,
+            at,
+        ) = self._phase6a2_start_approval(
+            request_id="PHASE6A2-STALE-FRESH"
+        )
+
+        with (
+            patch(
+                "sanitization_authorization."
+                "collect_current_drive_discovery",
+                return_value=snapshot,
+            ),
+            patch(
+                "sanitization_authorization._utc_now",
+                side_effect=[
+                    at + timedelta(seconds=1),
+                    at + timedelta(seconds=1),
+                    at + timedelta(seconds=62),
+                ],
+            ),
+        ):
+            result = registry.revalidate_approval(
+                evidence.approval_id,
+                request,
+                record,
+            )
+
+        self.assertEqual(
+            result.status,
+            auth.APPROVAL_STATUS_REVALIDATION_FAILED,
+        )
+
+    def test_future_skew_fresh_evaluation_fails_revalidation(
+        self,
+    ):
+        (
+            registry,
+            record,
+            request,
+            _challenge,
+            evidence,
+            snapshot,
+            at,
+        ) = self._phase6a2_start_approval(
+            request_id="PHASE6A2-FUTURE-FRESH"
+        )
+
+        with (
+            patch(
+                "sanitization_authorization."
+                "collect_current_drive_discovery",
+                return_value=snapshot,
+            ),
+            patch(
+                "sanitization_authorization._utc_now",
+                side_effect=[
+                    at + timedelta(seconds=1),
+                    at + timedelta(seconds=7),
+                    at + timedelta(seconds=1),
+                ],
+            ),
+        ):
+            result = registry.revalidate_approval(
+                evidence.approval_id,
+                request,
+                record,
+            )
+
+        self.assertEqual(
+            result.status,
+            auth.APPROVAL_STATUS_REVALIDATION_FAILED,
+        )
+
+    def test_approval_registry_lock_is_per_instance(
+        self,
+    ):
+        first = auth.ApprovalRegistry()
+        second = auth.ApprovalRegistry()
+
+        self.assertIsNot(
+            first._state_lock,
+            second._state_lock,
+        )
+
+    def test_concurrent_challenge_approval_is_atomic(
+        self,
+    ):
+        import threading
+
+        (
+            registry,
+            _record,
+            _request,
+            challenge,
+            _snapshot,
+            at,
+        ) = self._phase6a2_create_challenge(
+            request_id=(
+                "PHASE6A2-R5-CONCURRENT-APPROVAL"
+            )
+        )
+
+        barrier = threading.Barrier(2)
+
+        class RacingSet(set):
+            def __contains__(
+                self,
+                value,
+            ):
+                present = super().__contains__(
+                    value
+                )
+
+                if not present:
+                    try:
+                        barrier.wait(
+                            timeout=0.2
+                        )
+                    except threading.BrokenBarrierError:
+                        pass
+
+                return present
+
+        registry._approved_challenges = (
+            RacingSet(
+                registry._approved_challenges
+            )
+        )
+
+        approvals = []
+        errors = []
+
+        def worker():
+            try:
+                evidence = (
+                    registry.record_human_approval(
+                        challenge.challenge_id
+                    )
+                )
+
+                approvals.append(
+                    evidence.approval_id
+                )
+
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(
+                target=worker
+            ),
+            threading.Thread(
+                target=worker
+            ),
+        ]
+
+        with patch(
+            "sanitization_authorization._utc_now",
+            return_value=at,
+        ):
+            for thread in threads:
+                thread.start()
+
+            for thread in threads:
+                thread.join(timeout=5)
+
+        self.assertTrue(
+            all(
+                not thread.is_alive()
+                for thread in threads
+            )
+        )
+
+        self.assertEqual(
+            len(approvals),
+            1,
+        )
+
+        self.assertEqual(
+            len(errors),
+            1,
+        )
+
+        self.assertIsInstance(
+            errors[0],
+            auth.ApprovalError,
+        )
+
+        self.assertIn(
+            "already been approved",
+            str(errors[0]),
+        )
+
+    def test_concurrent_revalidation_consumption_is_atomic(
+        self,
+    ):
+        import threading
+
+        (
+            registry,
+            record,
+            request,
+            _challenge,
+            evidence,
+            snapshot,
+            at,
+        ) = self._phase6a2_start_approval(
+            request_id=(
+                "PHASE6A2-R5-CONCURRENT-REVALIDATION"
+            )
+        )
+
+        barrier = threading.Barrier(2)
+
+        class RacingSet(set):
+            def __contains__(
+                self,
+                value,
+            ):
+                present = super().__contains__(
+                    value
+                )
+
+                if not present:
+                    try:
+                        barrier.wait(
+                            timeout=0.2
+                        )
+                    except threading.BrokenBarrierError:
+                        pass
+
+                return present
+
+        registry._consumed_approvals = (
+            RacingSet(
+                registry._consumed_approvals
+            )
+        )
+
+        results = []
+        errors = []
+
+        def worker():
+            try:
+                result = (
+                    registry.revalidate_approval(
+                        evidence.approval_id,
+                        request,
+                        record,
+                    )
+                )
+
+                results.append(result)
+
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(
+                target=worker
+            ),
+            threading.Thread(
+                target=worker
+            ),
+        ]
+
+        with (
+            patch(
+                "sanitization_authorization."
+                "collect_current_drive_discovery",
+                return_value=snapshot,
+            ),
+            patch(
+                "sanitization_authorization._utc_now",
+                return_value=(
+                    at + timedelta(seconds=1)
+                ),
+            ),
+        ):
+            for thread in threads:
+                thread.start()
+
+            for thread in threads:
+                thread.join(timeout=5)
+
+        self.assertTrue(
+            all(
+                not thread.is_alive()
+                for thread in threads
+            )
+        )
+
+        self.assertEqual(
+            errors,
+            [],
+        )
+
+        self.assertEqual(
+            len(results),
+            2,
+        )
+
+        statuses = [
+            result.status
+            for result in results
+        ]
+
+        self.assertEqual(
+            statuses.count(
+                auth.APPROVAL_STATUS_REVALIDATED
+            ),
+            1,
+        )
+
+        consumed = [
+            result
+            for result in results
+            if (
+                result.status
+                == auth.APPROVAL_STATUS_REVALIDATION_FAILED
+                and result.reason_codes
+                == (
+                    "APPROVAL_ALREADY_CONSUMED",
+                )
+            )
+        ]
+
+        self.assertEqual(
+            len(consumed),
+            1,
+        )
+
+    def test_concurrent_challenge_token_collision_is_atomic(
+        self,
+    ):
+        import threading
+
+        (
+            _seed_registry,
+            record,
+            _seed_request,
+            _seed_challenge,
+            snapshot,
+            at,
+        ) = self._phase6a2_create_challenge(
+            request_id=(
+                "PHASE6A2-R6-CONCURRENT-SEED"
+            )
+        )
+
+        registry = auth.ApprovalRegistry()
+
+        request_a = self._phase6a2_request(
+            record,
+            request_id=(
+                "PHASE6A2-R6-CONCURRENT-A"
+            ),
+            at=at - timedelta(seconds=60),
+        )
+
+        request_b = self._phase6a2_request(
+            record,
+            request_id=(
+                "PHASE6A2-R6-CONCURRENT-B"
+            ),
+            at=at - timedelta(seconds=60),
+        )
+
+        forced_id = (
+            "apch_R6_FORCED_COLLISION_"
+            "0123456789ABCDEF"
+        )
+
+        start = threading.Barrier(2)
+        created = []
+        errors = []
+
+        def worker(request):
+            try:
+                start.wait(timeout=5)
+
+                created.append(
+                    registry.create_challenge(
+                        request,
+                        record,
+                    )
+                )
+            except Exception as exc:
+                errors.append(exc)
+
+        with (
+            patch(
+                "sanitization_authorization."
+                "collect_current_drive_discovery",
+                return_value=snapshot,
+            ),
+            patch(
+                "sanitization_authorization._utc_now",
+                return_value=at,
+            ),
+            patch(
+                "sanitization_authorization."
+                "_new_approval_token",
+                return_value=forced_id,
+            ),
+        ):
+            threads = [
+                threading.Thread(
+                    target=worker,
+                    args=(request_a,),
+                ),
+                threading.Thread(
+                    target=worker,
+                    args=(request_b,),
+                ),
+            ]
+
+            for thread in threads:
+                thread.start()
+
+            for thread in threads:
+                thread.join(timeout=5)
+
+        self.assertTrue(
+            all(
+                not thread.is_alive()
+                for thread in threads
+            )
+        )
+
+        self.assertEqual(
+            len(created),
+            1,
+        )
+
+        self.assertEqual(
+            len(errors),
+            1,
+        )
+
+        self.assertIsInstance(
+            errors[0],
+            auth.ApprovalError,
+        )
+
+        self.assertIn(
+            "could not allocate unique challenge_id",
+            str(errors[0]),
+        )
+
+        self.assertEqual(
+            len(registry._challenges),
+            1,
+        )
+
+    def test_challenge_token_collision_retries_then_succeeds(
+        self,
+    ):
+        (
+            _seed_registry,
+            record,
+            _seed_request,
+            _seed_challenge,
+            snapshot,
+            at,
+        ) = self._phase6a2_create_challenge(
+            request_id="PHASE6A2-R6-RETRY-SEED"
+        )
+
+        registry = auth.ApprovalRegistry()
+
+        request_a = self._phase6a2_request(
+            record,
+            request_id="PHASE6A2-R6-RETRY-A",
+            at=at - timedelta(seconds=60),
+        )
+
+        request_b = self._phase6a2_request(
+            record,
+            request_id="PHASE6A2-R6-RETRY-B",
+            at=at - timedelta(seconds=60),
+        )
+
+        existing_id = (
+            "apch_R6_EXISTING_0123456789ABCDEF"
+        )
+
+        unique_id = (
+            "apch_R6_UNIQUE_0123456789ABCDEF"
+        )
+
+        with (
+            patch(
+                "sanitization_authorization."
+                "collect_current_drive_discovery",
+                return_value=snapshot,
+            ),
+            patch(
+                "sanitization_authorization._utc_now",
+                return_value=at,
+            ),
+            patch(
+                "sanitization_authorization."
+                "_new_approval_token",
+                return_value=existing_id,
+            ),
+        ):
+            first = registry.create_challenge(
+                request_a,
+                record,
+            )
+
+        with (
+            patch(
+                "sanitization_authorization."
+                "collect_current_drive_discovery",
+                return_value=snapshot,
+            ),
+            patch(
+                "sanitization_authorization._utc_now",
+                return_value=at,
+            ),
+            patch(
+                "sanitization_authorization."
+                "_new_approval_token",
+                side_effect=(
+                    existing_id,
+                    unique_id,
+                ),
+            ),
+        ):
+            second = registry.create_challenge(
+                request_b,
+                record,
+            )
+
+        self.assertEqual(
+            first.challenge_id,
+            existing_id,
+        )
+
+        self.assertEqual(
+            second.challenge_id,
+            unique_id,
+        )
+
+        self.assertEqual(
+            len(registry._challenges),
+            2,
+        )
+
+    def test_repeated_challenge_token_collision_fails_bounded(
+        self,
+    ):
+        (
+            _seed_registry,
+            record,
+            _seed_request,
+            _seed_challenge,
+            snapshot,
+            at,
+        ) = self._phase6a2_create_challenge(
+            request_id=(
+                "PHASE6A2-R6-BOUNDED-CHAL-SEED"
+            )
+        )
+
+        registry = auth.ApprovalRegistry()
+
+        request_a = self._phase6a2_request(
+            record,
+            request_id=(
+                "PHASE6A2-R6-BOUNDED-CHAL-A"
+            ),
+            at=at - timedelta(seconds=60),
+        )
+
+        request_b = self._phase6a2_request(
+            record,
+            request_id=(
+                "PHASE6A2-R6-BOUNDED-CHAL-B"
+            ),
+            at=at - timedelta(seconds=60),
+        )
+
+        forced_id = (
+            "apch_R6_BOUNDED_0123456789ABCDEF"
+        )
+
+        with (
+            patch(
+                "sanitization_authorization."
+                "collect_current_drive_discovery",
+                return_value=snapshot,
+            ),
+            patch(
+                "sanitization_authorization._utc_now",
+                return_value=at,
+            ),
+            patch(
+                "sanitization_authorization."
+                "_new_approval_token",
+                return_value=forced_id,
+            ),
+        ):
+            registry.create_challenge(
+                request_a,
+                record,
+            )
+
+        with (
+            patch(
+                "sanitization_authorization."
+                "collect_current_drive_discovery",
+                return_value=snapshot,
+            ),
+            patch(
+                "sanitization_authorization._utc_now",
+                return_value=at,
+            ),
+            patch(
+                "sanitization_authorization."
+                "_new_approval_token",
+                return_value=forced_id,
+            ) as token_mock,
+        ):
+            with self.assertRaises(
+                auth.ApprovalError
+            ):
+                registry.create_challenge(
+                    request_b,
+                    record,
+                )
+
+        self.assertEqual(
+            token_mock.call_count,
+            auth._APPROVAL_TOKEN_ALLOCATION_MAX_ATTEMPTS,
+        )
+
+        self.assertEqual(
+            len(registry._challenges),
+            1,
+        )
+
+        acquired = (
+            registry._state_lock.acquire(
+                blocking=False
+            )
+        )
+
+        self.assertTrue(acquired)
+
+        if acquired:
+            registry._state_lock.release()
+
+    def test_repeated_approval_token_collision_fails_without_approving_challenge(
+        self,
+    ):
+        (
+            _seed_registry,
+            record,
+            _seed_request,
+            _seed_challenge,
+            snapshot,
+            at,
+        ) = self._phase6a2_create_challenge(
+            request_id=(
+                "PHASE6A2-R6-BOUNDED-APPR-SEED"
+            )
+        )
+
+        registry = auth.ApprovalRegistry()
+
+        request_a = self._phase6a2_request(
+            record,
+            request_id="PHASE6A2-R6-APPR-A",
+            at=at - timedelta(seconds=60),
+        )
+
+        request_b = self._phase6a2_request(
+            record,
+            request_id="PHASE6A2-R6-APPR-B",
+            at=at - timedelta(seconds=60),
+        )
+
+        with (
+            patch(
+                "sanitization_authorization."
+                "collect_current_drive_discovery",
+                return_value=snapshot,
+            ),
+            patch(
+                "sanitization_authorization._utc_now",
+                return_value=at,
+            ),
+            patch(
+                "sanitization_authorization."
+                "_new_approval_token",
+                side_effect=(
+                    "apch_R6_APPR_A_0123456789ABCDEF",
+                    "apch_R6_APPR_B_0123456789ABCDEF",
+                ),
+            ),
+        ):
+            challenge_a = registry.create_challenge(
+                request_a,
+                record,
+            )
+
+            challenge_b = registry.create_challenge(
+                request_b,
+                record,
+            )
+
+        existing_approval_id = (
+            "appr_R6_EXISTING_0123456789ABCDEF"
+        )
+
+        with (
+            patch(
+                "sanitization_authorization._utc_now",
+                return_value=at,
+            ),
+            patch(
+                "sanitization_authorization."
+                "_new_approval_token",
+                return_value=existing_approval_id,
+            ),
+        ):
+            registry.record_human_approval(
+                challenge_a.challenge_id
+            )
+
+        with (
+            patch(
+                "sanitization_authorization._utc_now",
+                return_value=at,
+            ),
+            patch(
+                "sanitization_authorization."
+                "_new_approval_token",
+                return_value=existing_approval_id,
+            ) as token_mock,
+        ):
+            with self.assertRaises(
+                auth.ApprovalError
+            ):
+                registry.record_human_approval(
+                    challenge_b.challenge_id
+                )
+
+        self.assertEqual(
+            token_mock.call_count,
+            auth._APPROVAL_TOKEN_ALLOCATION_MAX_ATTEMPTS,
+        )
+
+        self.assertNotIn(
+            challenge_b.challenge_id,
+            registry._approved_challenges,
+        )
+
+        self.assertEqual(
+            len(registry._approvals),
+            1,
+        )
+
+        acquired = (
+            registry._state_lock.acquire(
+                blocking=False
+            )
+        )
+
+        self.assertTrue(acquired)
+
+        if acquired:
+            registry._state_lock.release()
+
+        with (
+            patch(
+                "sanitization_authorization._utc_now",
+                return_value=at,
+            ),
+            patch(
+                "sanitization_authorization."
+                "_new_approval_token",
+                return_value=(
+                    "appr_R6_RECOVERY_0123456789ABCDEF"
+                ),
+            ),
+        ):
+            recovered = (
+                registry.record_human_approval(
+                    challenge_b.challenge_id
+                )
+            )
+
+        self.assertEqual(
+            recovered.challenge_id,
+            challenge_b.challenge_id,
+        )
+
+    def test_create_challenge_rechecks_expiry_after_lock_entry(
+        self,
+    ):
+        (
+            _registry,
+            record,
+            request,
+            _challenge,
+            snapshot,
+            at,
+        ) = self._phase6a2_create_challenge(
+            request_id=(
+                "PHASE6A2-R6-LOCK-TIME-SEED"
+            )
+        )
+
+        with (
+            patch(
+                "sanitization_authorization."
+                "collect_current_drive_discovery",
+                return_value=snapshot,
+            ),
+            patch(
+                "sanitization_authorization._utc_now",
+                return_value=at,
+            ),
+        ):
+            decision = (
+                auth.evaluate_current_authorization_prerequisites(
+                    request,
+                    record,
+                )
+            )
+
+        valid_until = auth._parse_utc(
+            decision.prerequisite_valid_until_utc,
+            "decision.prerequisite_valid_until_utc",
+        )
+
+        expired = (
+            valid_until
+            + timedelta(seconds=1)
+        )
+
+        registry = auth.ApprovalRegistry()
+
+        with (
+            patch(
+                "sanitization_authorization."
+                "evaluate_current_authorization_prerequisites",
+                return_value=decision,
+            ),
+            patch(
+                "sanitization_authorization."
+                "decision_is_current",
+                return_value=True,
+            ),
+            patch(
+                "sanitization_authorization._utc_now",
+                side_effect=(
+                    at,
+                    expired,
+                ),
+            ),
+            patch(
+                "sanitization_authorization."
+                "_new_approval_token",
+            ) as token_mock,
+        ):
+            with self.assertRaises(
+                auth.ApprovalError
+            ):
+                registry.create_challenge(
+                    request,
+                    record,
+                )
+
+        token_mock.assert_not_called()
+
+        self.assertEqual(
+            registry._challenges,
+            {},
+        )
+
+    def test_malformed_generated_challenge_tokens_fail_bounded_without_state(
+        self,
+    ):
+        invalid_tokens = (
+            "",
+            "   ",
+            "apch_",
+            "appr_WRONG_PREFIX",
+            " apch_LEADING_SPACE",
+            "apch_TRAILING_SPACE ",
+            "apch_CONTROL\nVALUE",
+            None,
+            123,
+        )
+
+        (
+            _seed_registry,
+            record,
+            _seed_request,
+            _seed_challenge,
+            snapshot,
+            at,
+        ) = self._phase6a2_create_challenge(
+            request_id=(
+                "PHASE6A2-R7-MALFORMED-CHAL-SEED"
+            )
+        )
+
+        for index, invalid_token in enumerate(
+            invalid_tokens
+        ):
+            with self.subTest(
+                token=repr(invalid_token)
+            ):
+                registry = auth.ApprovalRegistry()
+
+                request = self._phase6a2_request(
+                    record,
+                    request_id=(
+                        f"PHASE6A2-R7-MALFORMED-CHAL-{index}"
+                    ),
+                    at=at - timedelta(seconds=60),
+                )
+
+                with (
+                    patch(
+                        "sanitization_authorization."
+                        "collect_current_drive_discovery",
+                        return_value=snapshot,
+                    ),
+                    patch(
+                        "sanitization_authorization._utc_now",
+                        return_value=at,
+                    ),
+                    patch(
+                        "sanitization_authorization."
+                        "_new_approval_token",
+                        return_value=invalid_token,
+                    ) as token_mock,
+                ):
+                    with self.assertRaises(
+                        auth.ApprovalError
+                    ):
+                        registry.create_challenge(
+                            request,
+                            record,
+                        )
+
+                self.assertEqual(
+                    token_mock.call_count,
+                    auth._APPROVAL_TOKEN_ALLOCATION_MAX_ATTEMPTS,
+                )
+
+                self.assertEqual(
+                    registry._challenges,
+                    {},
+                )
+
+                acquired = (
+                    registry._state_lock.acquire(
+                        blocking=False
+                    )
+                )
+
+                self.assertTrue(acquired)
+
+                if acquired:
+                    registry._state_lock.release()
+
+    def test_malformed_generated_approval_tokens_fail_bounded_without_consuming_challenge(
+        self,
+    ):
+        invalid_tokens = (
+            "",
+            "   ",
+            "appr_",
+            "apch_WRONG_PREFIX",
+            " appr_LEADING_SPACE",
+            "appr_TRAILING_SPACE ",
+            "appr_CONTROL\nVALUE",
+            None,
+            123,
+        )
+
+        (
+            _seed_registry,
+            record,
+            _seed_request,
+            _seed_challenge,
+            snapshot,
+            at,
+        ) = self._phase6a2_create_challenge(
+            request_id=(
+                "PHASE6A2-R7-MALFORMED-APPR-SEED"
+            )
+        )
+
+        for index, invalid_token in enumerate(
+            invalid_tokens
+        ):
+            with self.subTest(
+                token=repr(invalid_token)
+            ):
+                registry = auth.ApprovalRegistry()
+
+                request = self._phase6a2_request(
+                    record,
+                    request_id=(
+                        f"PHASE6A2-R7-MALFORMED-APPR-{index}"
+                    ),
+                    at=at - timedelta(seconds=60),
+                )
+
+                challenge_token = (
+                    "apch_R7_VALID_"
+                    f"{index:04d}_0123456789ABCDEF"
+                )
+
+                with (
+                    patch(
+                        "sanitization_authorization."
+                        "collect_current_drive_discovery",
+                        return_value=snapshot,
+                    ),
+                    patch(
+                        "sanitization_authorization._utc_now",
+                        return_value=at,
+                    ),
+                    patch(
+                        "sanitization_authorization."
+                        "_new_approval_token",
+                        return_value=challenge_token,
+                    ),
+                ):
+                    challenge = (
+                        registry.create_challenge(
+                            request,
+                            record,
+                        )
+                    )
+
+                with (
+                    patch(
+                        "sanitization_authorization._utc_now",
+                        return_value=at,
+                    ),
+                    patch(
+                        "sanitization_authorization."
+                        "_new_approval_token",
+                        return_value=invalid_token,
+                    ) as token_mock,
+                ):
+                    with self.assertRaises(
+                        auth.ApprovalError
+                    ):
+                        registry.record_human_approval(
+                            challenge.challenge_id
+                        )
+
+                self.assertEqual(
+                    token_mock.call_count,
+                    auth._APPROVAL_TOKEN_ALLOCATION_MAX_ATTEMPTS,
+                )
+
+                self.assertEqual(
+                    registry._approvals,
+                    {},
+                )
+
+                self.assertNotIn(
+                    challenge.challenge_id,
+                    registry._approved_challenges,
+                )
+
+                acquired = (
+                    registry._state_lock.acquire(
+                        blocking=False
+                    )
+                )
+
+                self.assertTrue(acquired)
+
+                if acquired:
+                    registry._state_lock.release()
+
+    def test_malformed_challenge_token_then_valid_token_recovers(
+        self,
+    ):
+        (
+            _seed_registry,
+            record,
+            _seed_request,
+            _seed_challenge,
+            snapshot,
+            at,
+        ) = self._phase6a2_create_challenge(
+            request_id=(
+                "PHASE6A2-R7-CHAL-RECOVERY-SEED"
+            )
+        )
+
+        registry = auth.ApprovalRegistry()
+
+        request = self._phase6a2_request(
+            record,
+            request_id=(
+                "PHASE6A2-R7-CHAL-RECOVERY"
+            ),
+            at=at - timedelta(seconds=60),
+        )
+
+        valid_token = (
+            "apch_R7_RECOVERY_0123456789ABCDEF"
+        )
+
+        with (
+            patch(
+                "sanitization_authorization."
+                "collect_current_drive_discovery",
+                return_value=snapshot,
+            ),
+            patch(
+                "sanitization_authorization._utc_now",
+                return_value=at,
+            ),
+            patch(
+                "sanitization_authorization."
+                "_new_approval_token",
+                side_effect=(
+                    "",
+                    valid_token,
+                ),
+            ) as token_mock,
+        ):
+            challenge = registry.create_challenge(
+                request,
+                record,
+            )
+
+        self.assertEqual(
+            token_mock.call_count,
+            2,
+        )
+
+        self.assertEqual(
+            challenge.challenge_id,
+            valid_token,
+        )
+
+        self.assertIn(
+            valid_token,
+            registry._challenges,
+        )
+
+        self.assertTrue(
+            auth._approval_challenge_integrity_valid(
+                challenge
+            )
+        )
+
+    def test_malformed_approval_token_then_valid_token_recovers(
+        self,
+    ):
+        (
+            _seed_registry,
+            record,
+            _seed_request,
+            _seed_challenge,
+            snapshot,
+            at,
+        ) = self._phase6a2_create_challenge(
+            request_id=(
+                "PHASE6A2-R7-APPR-RECOVERY-SEED"
+            )
+        )
+
+        registry = auth.ApprovalRegistry()
+
+        request = self._phase6a2_request(
+            record,
+            request_id=(
+                "PHASE6A2-R7-APPR-RECOVERY"
+            ),
+            at=at - timedelta(seconds=60),
+        )
+
+        with (
+            patch(
+                "sanitization_authorization."
+                "collect_current_drive_discovery",
+                return_value=snapshot,
+            ),
+            patch(
+                "sanitization_authorization._utc_now",
+                return_value=at,
+            ),
+            patch(
+                "sanitization_authorization."
+                "_new_approval_token",
+                return_value=(
+                    "apch_R7_APPR_RECOVERY_"
+                    "0123456789ABCDEF"
+                ),
+            ),
+        ):
+            challenge = registry.create_challenge(
+                request,
+                record,
+            )
+
+        valid_approval_token = (
+            "appr_R7_RECOVERY_0123456789ABCDEF"
+        )
+
+        with (
+            patch(
+                "sanitization_authorization._utc_now",
+                return_value=at,
+            ),
+            patch(
+                "sanitization_authorization."
+                "_new_approval_token",
+                side_effect=(
+                    "",
+                    valid_approval_token,
+                ),
+            ) as token_mock,
+        ):
+            evidence = (
+                registry.record_human_approval(
+                    challenge.challenge_id
+                )
+            )
+
+        self.assertEqual(
+            token_mock.call_count,
+            2,
+        )
+
+        self.assertEqual(
+            evidence.approval_id,
+            valid_approval_token,
+        )
+
+        self.assertIn(
+            valid_approval_token,
+            registry._approvals,
+        )
+
+        self.assertIn(
+            challenge.challenge_id,
+            registry._approved_challenges,
+        )
+
+        self.assertTrue(
+            auth._approval_evidence_integrity_valid(
+                evidence
+            )
+        )
 
 if __name__ == "__main__":
     unittest.main()

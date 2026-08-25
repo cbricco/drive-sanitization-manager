@@ -41,6 +41,12 @@ MAX_DISCOVERY_AGE_SECONDS = 60
 MAX_FUTURE_SKEW_SECONDS = 5
 MAX_REQUEST_AGE_SECONDS = 300
 PREREQUISITE_LIFETIME_SECONDS = 300
+APPROVAL_POLICY_VERSION = "phase6a2-approval-v1"
+APPROVAL_CHALLENGE_LIFETIME_SECONDS = 180
+APPROVAL_REVALIDATION_WINDOW_SECONDS = 30
+
+APPROVAL_STATUS_REVALIDATED = "approval_revalidated"
+APPROVAL_STATUS_REVALIDATION_FAILED = "approval_revalidation_failed"
 
 STATUS_PREREQUISITES_MET = "prerequisites_met"
 STATUS_REFUSED = "refused"
@@ -1496,7 +1502,1195 @@ def decision_is_current(
     return now <= expires
 
 
+
+class ApprovalError(AuthorizationError):
+    """Raised when the ephemeral approval boundary fails closed."""
+
+
+@dataclass(frozen=True)
+class ApprovalChallenge:
+    challenge_id: str
+    policy_version: str
+    schema_version: int
+    request_id: str
+    request_hash: str
+    record_snapshot_hash: str
+    prerequisite_decision_id: str
+    target_binding_hash: str
+    created_at_utc: str
+    valid_until_utc: str
+    challenge_hash: str
+
+
+@dataclass(frozen=True)
+class HumanApprovalEvidence:
+    approval_id: str
+    challenge_id: str
+    policy_version: str
+    schema_version: int
+    request_id: str
+    request_hash: str
+    record_snapshot_hash: str
+    prerequisite_decision_id: str
+    target_binding_hash: str
+    approved_at_utc: str
+    revalidation_valid_until_utc: str
+    evidence_hash: str
+
+
+@dataclass(frozen=True)
+class ApprovalRevalidationDecision:
+    revalidation_id: str
+    policy_version: str
+    schema_version: int
+    approval_id: str
+    challenge_id: Optional[str]
+    request_id: Optional[str]
+    original_prerequisite_decision_id: Optional[str]
+    fresh_prerequisite_decision_id: Optional[str]
+    original_target_binding_hash: Optional[str]
+    fresh_target_binding_hash: Optional[str]
+    status: str
+    reason_codes: tuple[str, ...]
+    evaluated_at_utc: str
+
+
+def _approval_text(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value.strip())
+        and value == value.strip()
+        and not _contains_forbidden_control(value)
+    )
+
+
+def _new_approval_token(prefix: str) -> str:
+    import secrets
+
+    return f"{prefix}_{secrets.token_urlsafe(24)}"
+
+
+def _challenge_payload(
+    *,
+    challenge_id: str,
+    request_id: str,
+    request_hash: str,
+    record_snapshot_hash: str,
+    prerequisite_decision_id: str,
+    target_binding_hash: str,
+    created_at_utc: str,
+    valid_until_utc: str,
+) -> dict[str, Any]:
+    return {
+        "challenge_id": challenge_id,
+        "policy_version": APPROVAL_POLICY_VERSION,
+        "schema_version": SCHEMA_VERSION,
+        "request_id": request_id,
+        "request_hash": request_hash,
+        "record_snapshot_hash": record_snapshot_hash,
+        "prerequisite_decision_id": prerequisite_decision_id,
+        "target_binding_hash": target_binding_hash,
+        "created_at_utc": created_at_utc,
+        "valid_until_utc": valid_until_utc,
+    }
+
+
+def _approval_evidence_payload(
+    *,
+    approval_id: str,
+    challenge_id: str,
+    request_id: str,
+    request_hash: str,
+    record_snapshot_hash: str,
+    prerequisite_decision_id: str,
+    target_binding_hash: str,
+    approved_at_utc: str,
+    revalidation_valid_until_utc: str,
+) -> dict[str, Any]:
+    return {
+        "approval_id": approval_id,
+        "challenge_id": challenge_id,
+        "policy_version": APPROVAL_POLICY_VERSION,
+        "schema_version": SCHEMA_VERSION,
+        "request_id": request_id,
+        "request_hash": request_hash,
+        "record_snapshot_hash": record_snapshot_hash,
+        "prerequisite_decision_id": prerequisite_decision_id,
+        "target_binding_hash": target_binding_hash,
+        "approved_at_utc": approved_at_utc,
+        "revalidation_valid_until_utc": (
+            revalidation_valid_until_utc
+        ),
+    }
+
+
+def _approval_challenge_integrity_valid(
+    challenge: Any,
+) -> bool:
+    try:
+        if not isinstance(
+            challenge,
+            ApprovalChallenge,
+        ):
+            return False
+
+        if (
+            challenge.policy_version
+            != APPROVAL_POLICY_VERSION
+            or type(challenge.schema_version) is not int
+            or challenge.schema_version != SCHEMA_VERSION
+        ):
+            return False
+
+        for text_value in (
+            challenge.challenge_id,
+            challenge.request_id,
+        ):
+            if not _approval_text(text_value):
+                return False
+
+        for hash_value in (
+            challenge.request_hash,
+            challenge.record_snapshot_hash,
+            challenge.prerequisite_decision_id,
+            challenge.target_binding_hash,
+            challenge.challenge_hash,
+        ):
+            if not _canonical_hash_value(hash_value):
+                return False
+
+        created_at = _parse_utc(
+            challenge.created_at_utc,
+            "challenge.created_at_utc",
+        )
+
+        valid_until = _parse_utc(
+            challenge.valid_until_utc,
+            "challenge.valid_until_utc",
+        )
+
+        if (
+            _iso_utc(created_at)
+            != challenge.created_at_utc
+            or _iso_utc(valid_until)
+            != challenge.valid_until_utc
+            or valid_until
+            != created_at
+            + timedelta(
+                seconds=(
+                    APPROVAL_CHALLENGE_LIFETIME_SECONDS
+                )
+            )
+        ):
+            return False
+
+        payload = _challenge_payload(
+            challenge_id=challenge.challenge_id,
+            request_id=challenge.request_id,
+            request_hash=challenge.request_hash,
+            record_snapshot_hash=(
+                challenge.record_snapshot_hash
+            ),
+            prerequisite_decision_id=(
+                challenge.prerequisite_decision_id
+            ),
+            target_binding_hash=(
+                challenge.target_binding_hash
+            ),
+            created_at_utc=challenge.created_at_utc,
+            valid_until_utc=challenge.valid_until_utc,
+        )
+
+        return (
+            challenge.challenge_hash
+            == _canonical_hash(payload)
+        )
+    except Exception:
+        return False
+
+
+def _approval_evidence_integrity_valid(
+    evidence: Any,
+) -> bool:
+    try:
+        if not isinstance(
+            evidence,
+            HumanApprovalEvidence,
+        ):
+            return False
+
+        if (
+            evidence.policy_version
+            != APPROVAL_POLICY_VERSION
+            or type(evidence.schema_version) is not int
+            or evidence.schema_version != SCHEMA_VERSION
+        ):
+            return False
+
+        for text_value in (
+            evidence.approval_id,
+            evidence.challenge_id,
+            evidence.request_id,
+        ):
+            if not _approval_text(text_value):
+                return False
+
+        for hash_value in (
+            evidence.request_hash,
+            evidence.record_snapshot_hash,
+            evidence.prerequisite_decision_id,
+            evidence.target_binding_hash,
+            evidence.evidence_hash,
+        ):
+            if not _canonical_hash_value(hash_value):
+                return False
+
+        approved_at = _parse_utc(
+            evidence.approved_at_utc,
+            "evidence.approved_at_utc",
+        )
+
+        valid_until = _parse_utc(
+            evidence.revalidation_valid_until_utc,
+            "evidence.revalidation_valid_until_utc",
+        )
+
+        if (
+            _iso_utc(approved_at)
+            != evidence.approved_at_utc
+            or _iso_utc(valid_until)
+            != evidence.revalidation_valid_until_utc
+            or valid_until
+            != approved_at
+            + timedelta(
+                seconds=(
+                    APPROVAL_REVALIDATION_WINDOW_SECONDS
+                )
+            )
+        ):
+            return False
+
+        payload = _approval_evidence_payload(
+            approval_id=evidence.approval_id,
+            challenge_id=evidence.challenge_id,
+            request_id=evidence.request_id,
+            request_hash=evidence.request_hash,
+            record_snapshot_hash=(
+                evidence.record_snapshot_hash
+            ),
+            prerequisite_decision_id=(
+                evidence.prerequisite_decision_id
+            ),
+            target_binding_hash=(
+                evidence.target_binding_hash
+            ),
+            approved_at_utc=evidence.approved_at_utc,
+            revalidation_valid_until_utc=(
+                evidence.revalidation_valid_until_utc
+            ),
+        )
+
+        return (
+            evidence.evidence_hash
+            == _canonical_hash(payload)
+        )
+    except Exception:
+        return False
+
+
+def _approval_revalidation_result(
+    *,
+    approval_id: Any,
+    evidence: Optional[HumanApprovalEvidence],
+    fresh_decision: Optional[AuthorizationDecision],
+    status: str,
+    reason_codes: tuple[str, ...],
+    evaluated_at: datetime,
+) -> ApprovalRevalidationDecision:
+    safe_approval_id = (
+        approval_id
+        if isinstance(approval_id, str)
+        else ""
+    )
+
+    challenge_id = (
+        evidence.challenge_id
+        if isinstance(
+            evidence,
+            HumanApprovalEvidence,
+        )
+        else None
+    )
+
+    request_id = (
+        evidence.request_id
+        if isinstance(
+            evidence,
+            HumanApprovalEvidence,
+        )
+        else None
+    )
+
+    original_decision_id = (
+        evidence.prerequisite_decision_id
+        if isinstance(
+            evidence,
+            HumanApprovalEvidence,
+        )
+        else None
+    )
+
+    original_binding_hash = (
+        evidence.target_binding_hash
+        if isinstance(
+            evidence,
+            HumanApprovalEvidence,
+        )
+        else None
+    )
+
+    fresh_decision_id = (
+        fresh_decision.decision_id
+        if isinstance(
+            fresh_decision,
+            AuthorizationDecision,
+        )
+        else None
+    )
+
+    fresh_binding_hash = (
+        fresh_decision.target_binding_hash
+        if isinstance(
+            fresh_decision,
+            AuthorizationDecision,
+        )
+        else None
+    )
+
+    evaluated_text = _iso_utc(evaluated_at)
+
+    payload = {
+        "policy_version": APPROVAL_POLICY_VERSION,
+        "schema_version": SCHEMA_VERSION,
+        "approval_id": safe_approval_id,
+        "challenge_id": challenge_id,
+        "request_id": request_id,
+        "original_prerequisite_decision_id": (
+            original_decision_id
+        ),
+        "fresh_prerequisite_decision_id": (
+            fresh_decision_id
+        ),
+        "original_target_binding_hash": (
+            original_binding_hash
+        ),
+        "fresh_target_binding_hash": (
+            fresh_binding_hash
+        ),
+        "status": status,
+        "reason_codes": reason_codes,
+        "evaluated_at_utc": evaluated_text,
+    }
+
+    return ApprovalRevalidationDecision(
+        revalidation_id=_canonical_hash(payload),
+        policy_version=APPROVAL_POLICY_VERSION,
+        schema_version=SCHEMA_VERSION,
+        approval_id=safe_approval_id,
+        challenge_id=challenge_id,
+        request_id=request_id,
+        original_prerequisite_decision_id=(
+            original_decision_id
+        ),
+        fresh_prerequisite_decision_id=(
+            fresh_decision_id
+        ),
+        original_target_binding_hash=(
+            original_binding_hash
+        ),
+        fresh_target_binding_hash=(
+            fresh_binding_hash
+        ),
+        status=status,
+        reason_codes=reason_codes,
+        evaluated_at_utc=evaluated_text,
+    )
+
+
+_APPROVAL_TOKEN_ALLOCATION_MAX_ATTEMPTS = 32
+
+class ApprovalRegistry:
+    """Process-local Phase 6A2 approval registry.
+
+    Challenge creation obtains its prerequisite
+    decision internally.
+
+    record_human_approval() is a trusted core
+    boundary intended for a future trusted
+    UI/event adapter after a real human gesture.
+    This Python core cannot itself prove that a
+    physical human clicked anything.
+
+    Revalidation consumes an approval before
+    performing fresh discovery/evaluation.
+
+    Nothing here executes sanitization.
+    """
+
+    def __init__(self) -> None:
+        import threading
+
+        self._state_lock = threading.Lock()
+
+        self._challenges: dict[
+            str,
+            ApprovalChallenge,
+        ] = {}
+
+        self._approvals: dict[
+            str,
+            HumanApprovalEvidence,
+        ] = {}
+
+        self._approved_challenges: set[str] = set()
+        self._consumed_approvals: set[str] = set()
+
+    def create_challenge(
+        self,
+        request: AuthorizationRequest,
+        record: DriveRecord,
+    ) -> ApprovalChallenge:
+        decision = (
+            evaluate_current_authorization_prerequisites(
+                request,
+                record,
+            )
+        )
+
+        if (
+            not decision_integrity_valid(decision)
+            or not decision_is_current(decision)
+            or decision.status
+            != STATUS_PREREQUISITES_MET
+            or decision.request_hash is None
+            or decision.record_snapshot_hash is None
+            or decision.target_binding_hash is None
+        ):
+            raise ApprovalError(
+                "fresh authorization prerequisites "
+                "are not met"
+            )
+
+        now = _aware_utc(_utc_now())
+
+        if now is None:
+            raise ApprovalError(
+                "internal clock did not return "
+                "an aware timestamp"
+            )
+
+        try:
+            evaluated_at = _parse_utc(
+                decision.evaluated_at_utc,
+                "decision.evaluated_at_utc",
+            )
+
+            captured_at = _parse_utc(
+                decision.discovery_captured_at_utc,
+                "decision.discovery_captured_at_utc",
+            )
+
+            prerequisite_valid_until = _parse_utc(
+                decision.prerequisite_valid_until_utc,
+                "decision.prerequisite_valid_until_utc",
+            )
+        except AuthorizationError as exc:
+            raise ApprovalError(
+                "fresh prerequisite timestamps "
+                "are invalid"
+            ) from exc
+
+        lower_reference = max(
+            evaluated_at,
+            captured_at,
+        )
+
+        if (
+            now
+            < lower_reference
+            - timedelta(
+                seconds=MAX_FUTURE_SKEW_SECONDS
+            )
+        ):
+            raise ApprovalError(
+                "internal clock rolled back after "
+                "prerequisite evaluation"
+            )
+
+        if now > prerequisite_valid_until:
+            raise ApprovalError(
+                "fresh prerequisite decision "
+                "expired before challenge creation"
+            )
+
+        with self._state_lock:
+            locked_now = _aware_utc(_utc_now())
+
+            if locked_now is None:
+                raise ApprovalError(
+                    "internal clock did not return "
+                    "an aware timestamp"
+                )
+
+            if (
+                locked_now
+                < lower_reference
+                - timedelta(
+                    seconds=MAX_FUTURE_SKEW_SECONDS
+                )
+            ):
+                raise ApprovalError(
+                    "internal clock rolled back while "
+                    "waiting to create challenge"
+                )
+
+            if locked_now > prerequisite_valid_until:
+                raise ApprovalError(
+                    "fresh prerequisite decision "
+                    "expired before challenge allocation"
+                )
+
+            challenge_id = None
+
+            for _allocation_attempt in range(
+                _APPROVAL_TOKEN_ALLOCATION_MAX_ATTEMPTS
+            ):
+                candidate_challenge_id = (
+                    _new_approval_token("apch")
+                )
+
+                if (
+                    _approval_text(candidate_challenge_id)
+                    and candidate_challenge_id.startswith("apch_")
+                    and len(candidate_challenge_id) > len("apch_")
+                    and candidate_challenge_id
+                    not in self._challenges
+                ):
+                    challenge_id = candidate_challenge_id
+                    break
+
+            if challenge_id is None:
+                raise ApprovalError(
+                    "could not allocate unique challenge_id"
+                )
+
+            created_at_utc = _iso_utc(locked_now)
+
+            valid_until_utc = _iso_utc(
+                locked_now
+                + timedelta(
+                    seconds=(
+                        APPROVAL_CHALLENGE_LIFETIME_SECONDS
+                    )
+                )
+            )
+
+            payload = _challenge_payload(
+                challenge_id=challenge_id,
+                request_id=decision.request_id,
+                request_hash=decision.request_hash,
+                record_snapshot_hash=(
+                    decision.record_snapshot_hash
+                ),
+                prerequisite_decision_id=(
+                    decision.decision_id
+                ),
+                target_binding_hash=(
+                    decision.target_binding_hash
+                ),
+                created_at_utc=created_at_utc,
+                valid_until_utc=valid_until_utc,
+            )
+
+            challenge = ApprovalChallenge(
+                challenge_id=challenge_id,
+                policy_version=APPROVAL_POLICY_VERSION,
+                schema_version=SCHEMA_VERSION,
+                request_id=decision.request_id,
+                request_hash=decision.request_hash,
+                record_snapshot_hash=(
+                    decision.record_snapshot_hash
+                ),
+                prerequisite_decision_id=(
+                    decision.decision_id
+                ),
+                target_binding_hash=(
+                    decision.target_binding_hash
+                ),
+                created_at_utc=created_at_utc,
+                valid_until_utc=valid_until_utc,
+                challenge_hash=_canonical_hash(payload),
+            )
+
+            self._challenges[
+                challenge_id
+            ] = challenge
+
+            return challenge
+
+    def record_human_approval(
+        self,
+        challenge_id: str,
+    ) -> HumanApprovalEvidence:
+        """Record a trusted external approval event.
+
+        No approved boolean, caller timestamp,
+        caller nonce, AuthorizationDecision, or
+        caller-created evidence is accepted.
+        """
+
+        if not _approval_text(challenge_id):
+            raise ApprovalError(
+                "challenge_id is invalid"
+            )
+
+        with self._state_lock:
+            challenge = self._challenges.get(
+                challenge_id
+            )
+
+            if (
+                challenge is None
+                or not _approval_challenge_integrity_valid(
+                    challenge
+                )
+            ):
+                raise ApprovalError(
+                    "challenge is unknown or invalid"
+                )
+
+            if (
+                challenge_id
+                in self._approved_challenges
+            ):
+                raise ApprovalError(
+                    "challenge has already been approved"
+                )
+
+            now = _aware_utc(_utc_now())
+
+            if now is None:
+                raise ApprovalError(
+                    "internal clock did not return "
+                    "an aware timestamp"
+                )
+
+            try:
+                created_at = _parse_utc(
+                    challenge.created_at_utc,
+                    "challenge.created_at_utc",
+                )
+
+                valid_until = _parse_utc(
+                    challenge.valid_until_utc,
+                    "challenge.valid_until_utc",
+                )
+            except AuthorizationError as exc:
+                raise ApprovalError(
+                    "challenge timestamps are invalid"
+                ) from exc
+
+            if (
+                now
+                < created_at
+                - timedelta(
+                    seconds=MAX_FUTURE_SKEW_SECONDS
+                )
+            ):
+                raise ApprovalError(
+                    "internal clock is behind "
+                    "challenge creation"
+                )
+
+            if now > valid_until:
+                raise ApprovalError(
+                    "challenge has expired"
+                )
+
+            approval_id = None
+
+            for _allocation_attempt in range(
+                _APPROVAL_TOKEN_ALLOCATION_MAX_ATTEMPTS
+            ):
+                candidate_approval_id = (
+                    _new_approval_token("appr")
+                )
+
+                if (
+                    _approval_text(candidate_approval_id)
+                    and candidate_approval_id.startswith("appr_")
+                    and len(candidate_approval_id) > len("appr_")
+                    and candidate_approval_id
+                    not in self._approvals
+                ):
+                    approval_id = candidate_approval_id
+                    break
+
+            if approval_id is None:
+                raise ApprovalError(
+                    "could not allocate unique approval_id"
+                )
+
+            approved_at_utc = _iso_utc(now)
+
+            revalidation_valid_until_utc = _iso_utc(
+                now
+                + timedelta(
+                    seconds=(
+                        APPROVAL_REVALIDATION_WINDOW_SECONDS
+                    )
+                )
+            )
+
+            payload = _approval_evidence_payload(
+                approval_id=approval_id,
+                challenge_id=challenge.challenge_id,
+                request_id=challenge.request_id,
+                request_hash=challenge.request_hash,
+                record_snapshot_hash=(
+                    challenge.record_snapshot_hash
+                ),
+                prerequisite_decision_id=(
+                    challenge.prerequisite_decision_id
+                ),
+                target_binding_hash=(
+                    challenge.target_binding_hash
+                ),
+                approved_at_utc=approved_at_utc,
+                revalidation_valid_until_utc=(
+                    revalidation_valid_until_utc
+                ),
+            )
+
+            evidence = HumanApprovalEvidence(
+                approval_id=approval_id,
+                challenge_id=challenge.challenge_id,
+                policy_version=APPROVAL_POLICY_VERSION,
+                schema_version=SCHEMA_VERSION,
+                request_id=challenge.request_id,
+                request_hash=challenge.request_hash,
+                record_snapshot_hash=(
+                    challenge.record_snapshot_hash
+                ),
+                prerequisite_decision_id=(
+                    challenge.prerequisite_decision_id
+                ),
+                target_binding_hash=(
+                    challenge.target_binding_hash
+                ),
+                approved_at_utc=approved_at_utc,
+                revalidation_valid_until_utc=(
+                    revalidation_valid_until_utc
+                ),
+                evidence_hash=_canonical_hash(payload),
+            )
+
+            self._approvals[
+                approval_id
+            ] = evidence
+
+            self._approved_challenges.add(
+                challenge_id
+            )
+
+            return evidence
+
+    def revalidate_approval(
+        self,
+        approval_id: Any,
+        request: Any,
+        record: Any,
+    ) -> ApprovalRevalidationDecision:
+        """Consume one approval and collect fresh evidence.
+
+        approval_revalidated means only that one
+        registry-recorded approval matched one
+        fresh positive prerequisite evaluation.
+
+        It is not execution authority.
+        """
+
+        now = _aware_utc(_utc_now())
+
+        if now is None:
+            now = datetime(
+                1970,
+                1,
+                1,
+                tzinfo=timezone.utc,
+            )
+
+        if not _approval_text(approval_id):
+            return _approval_revalidation_result(
+                approval_id=approval_id,
+                evidence=None,
+                fresh_decision=None,
+                status=(
+                    APPROVAL_STATUS_REVALIDATION_FAILED
+                ),
+                reason_codes=(
+                    "APPROVAL_ID_INVALID",
+                ),
+                evaluated_at=now,
+            )
+
+        with self._state_lock:
+            evidence = self._approvals.get(
+                approval_id
+            )
+
+            if evidence is None:
+                return _approval_revalidation_result(
+                    approval_id=approval_id,
+                    evidence=None,
+                    fresh_decision=None,
+                    status=(
+                        APPROVAL_STATUS_REVALIDATION_FAILED
+                    ),
+                    reason_codes=(
+                        "APPROVAL_UNKNOWN",
+                    ),
+                    evaluated_at=now,
+                )
+
+            if (
+                approval_id
+                in self._consumed_approvals
+            ):
+                return _approval_revalidation_result(
+                    approval_id=approval_id,
+                    evidence=evidence,
+                    fresh_decision=None,
+                    status=(
+                        APPROVAL_STATUS_REVALIDATION_FAILED
+                    ),
+                    reason_codes=(
+                        "APPROVAL_ALREADY_CONSUMED",
+                    ),
+                    evaluated_at=now,
+                )
+
+            # One known approval gets exactly one
+            # revalidation attempt, success or failure.
+            self._consumed_approvals.add(
+                approval_id
+            )
+
+        if not _approval_evidence_integrity_valid(
+            evidence
+        ):
+            return _approval_revalidation_result(
+                approval_id=approval_id,
+                evidence=evidence,
+                fresh_decision=None,
+                status=(
+                    APPROVAL_STATUS_REVALIDATION_FAILED
+                ),
+                reason_codes=(
+                    "APPROVAL_EVIDENCE_INVALID",
+                ),
+                evaluated_at=now,
+            )
+
+        challenge = self._challenges.get(
+            evidence.challenge_id
+        )
+
+        if (
+            challenge is None
+            or not _approval_challenge_integrity_valid(
+                challenge
+            )
+            or evidence.challenge_id
+            not in self._approved_challenges
+            or challenge.request_id
+            != evidence.request_id
+            or challenge.request_hash
+            != evidence.request_hash
+            or challenge.record_snapshot_hash
+            != evidence.record_snapshot_hash
+            or challenge.prerequisite_decision_id
+            != evidence.prerequisite_decision_id
+            or challenge.target_binding_hash
+            != evidence.target_binding_hash
+        ):
+            return _approval_revalidation_result(
+                approval_id=approval_id,
+                evidence=evidence,
+                fresh_decision=None,
+                status=(
+                    APPROVAL_STATUS_REVALIDATION_FAILED
+                ),
+                reason_codes=(
+                    "APPROVAL_PROVENANCE_INVALID",
+                ),
+                evaluated_at=now,
+            )
+
+        try:
+            approved_at = _parse_utc(
+                evidence.approved_at_utc,
+                "evidence.approved_at_utc",
+            )
+
+            valid_until = _parse_utc(
+                evidence.revalidation_valid_until_utc,
+                (
+                    "evidence."
+                    "revalidation_valid_until_utc"
+                ),
+            )
+        except AuthorizationError:
+            return _approval_revalidation_result(
+                approval_id=approval_id,
+                evidence=evidence,
+                fresh_decision=None,
+                status=(
+                    APPROVAL_STATUS_REVALIDATION_FAILED
+                ),
+                reason_codes=(
+                    "APPROVAL_EVIDENCE_INVALID",
+                ),
+                evaluated_at=now,
+            )
+
+        if (
+            now
+            < approved_at
+            - timedelta(
+                seconds=MAX_FUTURE_SKEW_SECONDS
+            )
+        ):
+            return _approval_revalidation_result(
+                approval_id=approval_id,
+                evidence=evidence,
+                fresh_decision=None,
+                status=(
+                    APPROVAL_STATUS_REVALIDATION_FAILED
+                ),
+                reason_codes=(
+                    "APPROVAL_CLOCK_INVALID",
+                ),
+                evaluated_at=now,
+            )
+
+        if now > valid_until:
+            return _approval_revalidation_result(
+                approval_id=approval_id,
+                evidence=evidence,
+                fresh_decision=None,
+                status=(
+                    APPROVAL_STATUS_REVALIDATION_FAILED
+                ),
+                reason_codes=(
+                    "APPROVAL_EXPIRED",
+                ),
+                evaluated_at=now,
+            )
+
+        fresh = (
+            evaluate_current_authorization_prerequisites(
+                request,
+                record,
+            )
+        )
+
+        try:
+            fresh_captured_at = _parse_utc(
+                fresh.discovery_captured_at_utc,
+                "fresh.discovery_captured_at_utc",
+            )
+
+            fresh_evaluated_at = _parse_utc(
+                fresh.evaluated_at_utc,
+                "fresh.evaluated_at_utc",
+            )
+        except Exception:
+            return _approval_revalidation_result(
+                approval_id=approval_id,
+                evidence=evidence,
+                fresh_decision=fresh,
+                status=(
+                    APPROVAL_STATUS_REVALIDATION_FAILED
+                ),
+                reason_codes=(
+                    "FRESH_DECISION_INVALID",
+                ),
+                evaluated_at=now,
+            )
+
+        fresh_lower_reference = max(
+            approved_at,
+            now,
+        )
+
+        if (
+            fresh_captured_at
+            < fresh_lower_reference
+            - timedelta(
+                seconds=MAX_FUTURE_SKEW_SECONDS
+            )
+            or fresh_evaluated_at
+            < fresh_lower_reference
+            - timedelta(
+                seconds=MAX_FUTURE_SKEW_SECONDS
+            )
+        ):
+            return _approval_revalidation_result(
+                approval_id=approval_id,
+                evidence=evidence,
+                fresh_decision=fresh,
+                status=(
+                    APPROVAL_STATUS_REVALIDATION_FAILED
+                ),
+                reason_codes=(
+                    "FRESH_CLOCK_INVALID",
+                ),
+                evaluated_at=now,
+            )
+
+        if fresh_evaluated_at > valid_until:
+            return _approval_revalidation_result(
+                approval_id=approval_id,
+                evidence=evidence,
+                fresh_decision=fresh,
+                status=(
+                    APPROVAL_STATUS_REVALIDATION_FAILED
+                ),
+                reason_codes=(
+                    "REVALIDATION_WINDOW_EXPIRED",
+                ),
+                evaluated_at=fresh_evaluated_at,
+            )
+
+        if not decision_integrity_valid(fresh):
+            return _approval_revalidation_result(
+                approval_id=approval_id,
+                evidence=evidence,
+                fresh_decision=fresh,
+                status=(
+                    APPROVAL_STATUS_REVALIDATION_FAILED
+                ),
+                reason_codes=(
+                    "FRESH_DECISION_INVALID",
+                ),
+                evaluated_at=fresh_evaluated_at,
+            )
+
+        if (
+            fresh.status
+            != STATUS_PREREQUISITES_MET
+        ):
+            return _approval_revalidation_result(
+                approval_id=approval_id,
+                evidence=evidence,
+                fresh_decision=fresh,
+                status=(
+                    APPROVAL_STATUS_REVALIDATION_FAILED
+                ),
+                reason_codes=(
+                    "FRESH_PREREQUISITES_NOT_MET",
+                ),
+                evaluated_at=fresh_evaluated_at,
+            )
+
+        if not decision_is_current(fresh):
+            return _approval_revalidation_result(
+                approval_id=approval_id,
+                evidence=evidence,
+                fresh_decision=fresh,
+                status=(
+                    APPROVAL_STATUS_REVALIDATION_FAILED
+                ),
+                reason_codes=(
+                    "FRESH_DECISION_NOT_CURRENT",
+                ),
+                evaluated_at=fresh_evaluated_at,
+            )
+
+        if (
+            fresh.request_id
+            != evidence.request_id
+            or fresh.request_hash
+            != evidence.request_hash
+        ):
+            return _approval_revalidation_result(
+                approval_id=approval_id,
+                evidence=evidence,
+                fresh_decision=fresh,
+                status=(
+                    APPROVAL_STATUS_REVALIDATION_FAILED
+                ),
+                reason_codes=(
+                    "REQUEST_CHANGED",
+                ),
+                evaluated_at=fresh_evaluated_at,
+            )
+
+        if (
+            fresh.record_snapshot_hash
+            != evidence.record_snapshot_hash
+        ):
+            return _approval_revalidation_result(
+                approval_id=approval_id,
+                evidence=evidence,
+                fresh_decision=fresh,
+                status=(
+                    APPROVAL_STATUS_REVALIDATION_FAILED
+                ),
+                reason_codes=(
+                    "RECORD_CHANGED",
+                ),
+                evaluated_at=fresh_evaluated_at,
+            )
+
+        if (
+            fresh.target_binding_hash
+            != evidence.target_binding_hash
+        ):
+            return _approval_revalidation_result(
+                approval_id=approval_id,
+                evidence=evidence,
+                fresh_decision=fresh,
+                status=(
+                    APPROVAL_STATUS_REVALIDATION_FAILED
+                ),
+                reason_codes=(
+                    "TARGET_BINDING_CHANGED",
+                ),
+                evaluated_at=fresh_evaluated_at,
+            )
+
+        return _approval_revalidation_result(
+            approval_id=approval_id,
+            evidence=evidence,
+            fresh_decision=fresh,
+            status=APPROVAL_STATUS_REVALIDATED,
+            reason_codes=(),
+            evaluated_at=fresh_evaluated_at,
+        )
+
 __all__ = [
+    "APPROVAL_POLICY_VERSION",
+    "APPROVAL_CHALLENGE_LIFETIME_SECONDS",
+    "APPROVAL_REVALIDATION_WINDOW_SECONDS",
+    "APPROVAL_STATUS_REVALIDATED",
+    "APPROVAL_STATUS_REVALIDATION_FAILED",
+    "ApprovalError",
+    "ApprovalChallenge",
+    "HumanApprovalEvidence",
+    "ApprovalRevalidationDecision",
+    "ApprovalRegistry",
     "AuthorizationDecision",
     "AuthorizationError",
     "AuthorizationRequest",
