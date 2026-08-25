@@ -7426,6 +7426,896 @@ def build_immutable_execution_handoff_contract(
         )
 
     return handoff
+
+FRESH_TARGET_REVALIDATION_POLICY_VERSION = (
+    "phase6e-a-fresh-physical-target-v1"
+)
+FRESH_TARGET_REVALIDATION_SCHEMA_VERSION = 1
+FRESH_TARGET_REVALIDATION_STATUS_SATISFIED = (
+    "target_revalidation_satisfied"
+)
+
+
+class FreshPhysicalTargetRevalidationError(
+    AuthorizationError
+):
+    """Fresh physical-target revalidation failed closed."""
+
+
+@dataclass(frozen=True)
+class FreshPhysicalTargetRevalidationDecision:
+    """Immutable read-only revalidation result for one 6D-D handoff.
+
+    A satisfied result means the existing Phase-4/Phase-5 read-only
+    discovery/evaluation path freshly observed the same exact target and
+    found the same safe constraint state.
+
+    It is not execution authorization, executor readiness, a command,
+    a device handle, sanitization, verification, or proof that the target
+    cannot change after this observation.
+    """
+
+    revalidation_id: str
+    policy_version: str
+    schema_version: int
+    status: str
+
+    handoff_id: str
+    gate_id: str
+    binding_id: str
+    journal_entry_hash: str
+
+    fresh_prerequisite_decision_id: str
+    fresh_discovery_snapshot_hash: str
+
+    request_id: str
+    request_hash: str
+    record_snapshot_hash: str
+
+    method_profile_id: str
+    operation: str
+
+    prior_target_binding_hash: str
+    fresh_target_binding_hash: str
+    constraint_evaluation_hash: str
+
+    target_path: str
+    target_serial: Optional[str]
+    target_wwn: Optional[str]
+    target_size_bytes: int
+    target_model: Optional[str]
+    target_transport: Optional[str]
+
+    target_read_only: bool
+    target_mounted: bool
+    target_protected: bool
+    target_system_protected: bool
+    target_review_required: bool
+    target_ambiguous: bool
+
+    discovery_captured_at_utc: str
+    evaluated_at_utc: str
+    valid_until_utc: str
+
+    execution_supported: bool
+    executor_eligible: bool
+    requires_separate_executor_authorization: bool
+
+
+def _fresh_target_revalidation_payload(
+    *,
+    policy_version: str,
+    schema_version: int,
+    status: str,
+    handoff_id: str,
+    gate_id: str,
+    binding_id: str,
+    journal_entry_hash: str,
+    fresh_prerequisite_decision_id: str,
+    fresh_discovery_snapshot_hash: str,
+    request_id: str,
+    request_hash: str,
+    record_snapshot_hash: str,
+    method_profile_id: str,
+    operation: str,
+    prior_target_binding_hash: str,
+    fresh_target_binding_hash: str,
+    constraint_evaluation_hash: str,
+    target_path: str,
+    target_serial: Optional[str],
+    target_wwn: Optional[str],
+    target_size_bytes: int,
+    target_model: Optional[str],
+    target_transport: Optional[str],
+    target_read_only: bool,
+    target_mounted: bool,
+    target_protected: bool,
+    target_system_protected: bool,
+    target_review_required: bool,
+    target_ambiguous: bool,
+    discovery_captured_at_utc: str,
+    evaluated_at_utc: str,
+    valid_until_utc: str,
+    execution_supported: bool,
+    executor_eligible: bool,
+    requires_separate_executor_authorization: bool,
+) -> dict[str, Any]:
+    return {
+        "policy_version": policy_version,
+        "schema_version": schema_version,
+        "status": status,
+        "handoff_id": handoff_id,
+        "gate_id": gate_id,
+        "binding_id": binding_id,
+        "journal_entry_hash":
+            journal_entry_hash,
+        "fresh_prerequisite_decision_id":
+            fresh_prerequisite_decision_id,
+        "fresh_discovery_snapshot_hash":
+            fresh_discovery_snapshot_hash,
+        "request_id": request_id,
+        "request_hash": request_hash,
+        "record_snapshot_hash":
+            record_snapshot_hash,
+        "method_profile_id":
+            method_profile_id,
+        "operation": operation,
+        "prior_target_binding_hash":
+            prior_target_binding_hash,
+        "fresh_target_binding_hash":
+            fresh_target_binding_hash,
+        "constraint_evaluation_hash":
+            constraint_evaluation_hash,
+        "target_path": target_path,
+        "target_serial": target_serial,
+        "target_wwn": target_wwn,
+        "target_size_bytes":
+            target_size_bytes,
+        "target_model": target_model,
+        "target_transport":
+            target_transport,
+        "target_read_only":
+            target_read_only,
+        "target_mounted":
+            target_mounted,
+        "target_protected":
+            target_protected,
+        "target_system_protected":
+            target_system_protected,
+        "target_review_required":
+            target_review_required,
+        "target_ambiguous":
+            target_ambiguous,
+        "discovery_captured_at_utc":
+            discovery_captured_at_utc,
+        "evaluated_at_utc":
+            evaluated_at_utc,
+        "valid_until_utc":
+            valid_until_utc,
+        "execution_supported":
+            execution_supported,
+        "executor_eligible":
+            executor_eligible,
+        "requires_separate_executor_authorization":
+            requires_separate_executor_authorization,
+    }
+
+
+def _fresh_physical_target_revalidation_integrity_valid(
+    decision: Any,
+) -> bool:
+    """Check result internal consistency only."""
+
+    try:
+        if not isinstance(
+            decision,
+            FreshPhysicalTargetRevalidationDecision,
+        ):
+            return False
+
+        if (
+            decision.policy_version
+            != FRESH_TARGET_REVALIDATION_POLICY_VERSION
+            or type(decision.schema_version)
+            is not int
+            or decision.schema_version
+            != FRESH_TARGET_REVALIDATION_SCHEMA_VERSION
+            or decision.status
+            != FRESH_TARGET_REVALIDATION_STATUS_SATISFIED
+        ):
+            return False
+
+        if (
+            not isinstance(
+                decision.revalidation_id,
+                str,
+            )
+            or not decision.revalidation_id.startswith(
+                "ptrv_"
+            )
+            or len(decision.revalidation_id)
+            != len("ptrv_") + 64
+            or not all(
+                character
+                in "0123456789abcdef"
+                for character
+                in decision.revalidation_id[
+                    len("ptrv_"):
+                ]
+            )
+        ):
+            return False
+
+        if not _durable_prefixed_hex_id(
+            decision.handoff_id,
+            "xhnd_",
+        ):
+            return False
+
+        if not _durable_prefixed_hex_id(
+            decision.gate_id,
+            "xgate_",
+        ):
+            return False
+
+        if not _durable_prefixed_hex_id(
+            decision.binding_id,
+            "xeb_",
+        ):
+            return False
+
+        for text_value in (
+            decision.request_id,
+            decision.method_profile_id,
+            decision.operation,
+            decision.target_path,
+        ):
+            if not _approval_text(
+                text_value
+            ):
+                return False
+
+        for hash_value in (
+            decision.journal_entry_hash,
+            decision.fresh_prerequisite_decision_id,
+            decision.fresh_discovery_snapshot_hash,
+            decision.request_hash,
+            decision.record_snapshot_hash,
+            decision.prior_target_binding_hash,
+            decision.fresh_target_binding_hash,
+            decision.constraint_evaluation_hash,
+        ):
+            if not _canonical_hash_value(
+                hash_value
+            ):
+                return False
+
+        if (
+            decision.prior_target_binding_hash
+            != decision.fresh_target_binding_hash
+        ):
+            return False
+
+        serial = _candidate_identity(
+            decision.target_serial
+        )
+
+        wwn = _candidate_identity(
+            decision.target_wwn
+        )
+
+        if (
+            decision.target_serial is not None
+            and serial
+            != decision.target_serial
+        ):
+            return False
+
+        if (
+            decision.target_wwn is not None
+            and wwn
+            != decision.target_wwn
+        ):
+            return False
+
+        if serial is None and wwn is None:
+            return False
+
+        if (
+            type(decision.target_size_bytes)
+            is not int
+            or decision.target_size_bytes <= 0
+        ):
+            return False
+
+        for optional_value in (
+            decision.target_model,
+            decision.target_transport,
+        ):
+            if optional_value is None:
+                continue
+
+            if (
+                not isinstance(
+                    optional_value,
+                    str,
+                )
+                or not optional_value.strip()
+                or optional_value
+                != optional_value.strip()
+                or _contains_forbidden_control(
+                    optional_value
+                )
+            ):
+                return False
+
+        safety_flags = (
+            decision.target_read_only,
+            decision.target_mounted,
+            decision.target_protected,
+            decision.target_system_protected,
+            decision.target_review_required,
+            decision.target_ambiguous,
+        )
+
+        if any(
+            type(value) is not bool
+            for value in safety_flags
+        ):
+            return False
+
+        if any(safety_flags):
+            return False
+
+        if (
+            type(decision.execution_supported)
+            is not bool
+            or decision.execution_supported
+            is not False
+            or type(
+                decision.executor_eligible
+            )
+            is not bool
+            or decision.executor_eligible
+            is not False
+            or type(
+                decision.requires_separate_executor_authorization
+            )
+            is not bool
+            or decision.requires_separate_executor_authorization
+            is not True
+        ):
+            return False
+
+        captured_at = _parse_utc(
+            decision.discovery_captured_at_utc,
+            "decision.discovery_captured_at_utc",
+        )
+
+        evaluated_at = _parse_utc(
+            decision.evaluated_at_utc,
+            "decision.evaluated_at_utc",
+        )
+
+        valid_until = _parse_utc(
+            decision.valid_until_utc,
+            "decision.valid_until_utc",
+        )
+
+        if (
+            _iso_utc(captured_at)
+            != decision.discovery_captured_at_utc
+            or _iso_utc(evaluated_at)
+            != decision.evaluated_at_utc
+            or _iso_utc(valid_until)
+            != decision.valid_until_utc
+        ):
+            return False
+
+        if (
+            captured_at
+            > evaluated_at
+            + timedelta(
+                seconds=MAX_FUTURE_SKEW_SECONDS
+            )
+        ):
+            return False
+
+        if (
+            evaluated_at - captured_at
+            > timedelta(
+                seconds=MAX_DISCOVERY_AGE_SECONDS
+            )
+        ):
+            return False
+
+        if (
+            valid_until
+            != evaluated_at
+            + timedelta(
+                seconds=PREREQUISITE_LIFETIME_SECONDS
+            )
+        ):
+            return False
+
+        payload = _fresh_target_revalidation_payload(
+            policy_version=(
+                decision.policy_version
+            ),
+            schema_version=(
+                decision.schema_version
+            ),
+            status=decision.status,
+            handoff_id=decision.handoff_id,
+            gate_id=decision.gate_id,
+            binding_id=decision.binding_id,
+            journal_entry_hash=(
+                decision.journal_entry_hash
+            ),
+            fresh_prerequisite_decision_id=(
+                decision.fresh_prerequisite_decision_id
+            ),
+            fresh_discovery_snapshot_hash=(
+                decision.fresh_discovery_snapshot_hash
+            ),
+            request_id=decision.request_id,
+            request_hash=decision.request_hash,
+            record_snapshot_hash=(
+                decision.record_snapshot_hash
+            ),
+            method_profile_id=(
+                decision.method_profile_id
+            ),
+            operation=decision.operation,
+            prior_target_binding_hash=(
+                decision.prior_target_binding_hash
+            ),
+            fresh_target_binding_hash=(
+                decision.fresh_target_binding_hash
+            ),
+            constraint_evaluation_hash=(
+                decision.constraint_evaluation_hash
+            ),
+            target_path=decision.target_path,
+            target_serial=decision.target_serial,
+            target_wwn=decision.target_wwn,
+            target_size_bytes=(
+                decision.target_size_bytes
+            ),
+            target_model=decision.target_model,
+            target_transport=(
+                decision.target_transport
+            ),
+            target_read_only=(
+                decision.target_read_only
+            ),
+            target_mounted=(
+                decision.target_mounted
+            ),
+            target_protected=(
+                decision.target_protected
+            ),
+            target_system_protected=(
+                decision.target_system_protected
+            ),
+            target_review_required=(
+                decision.target_review_required
+            ),
+            target_ambiguous=(
+                decision.target_ambiguous
+            ),
+            discovery_captured_at_utc=(
+                decision.discovery_captured_at_utc
+            ),
+            evaluated_at_utc=(
+                decision.evaluated_at_utc
+            ),
+            valid_until_utc=(
+                decision.valid_until_utc
+            ),
+            execution_supported=(
+                decision.execution_supported
+            ),
+            executor_eligible=(
+                decision.executor_eligible
+            ),
+            requires_separate_executor_authorization=(
+                decision.requires_separate_executor_authorization
+            ),
+        )
+
+        payload_hash = _canonical_hash(
+            payload
+        )
+
+        return (
+            decision.revalidation_id
+            == (
+                "ptrv_"
+                + payload_hash.split(":", 1)[1]
+            )
+        )
+
+    except Exception:
+        return False
+
+
+def revalidate_physical_target_for_execution_handoff(
+    *,
+    registry: Any,
+    approval_id: Any,
+    request: Any,
+    record: Any,
+    journal: Any,
+    gate: Any,
+) -> FreshPhysicalTargetRevalidationDecision:
+    """Freshly revalidate one 6D-D handoff using established discovery.
+
+    The exact immutable handoff is rebuilt internally from registry, gate,
+    request, record, and completed journal evidence.
+
+    Fresh physical state is then obtained only through
+    evaluate_current_authorization_prerequisites(), which owns the fixed
+    Phase-4 read-only collector.
+
+    No command, executor, approval event, or destructive mutation occurs.
+    """
+
+    try:
+        handoff = (
+            build_immutable_execution_handoff_contract(
+                registry=registry,
+                approval_id=approval_id,
+                request=request,
+                record=record,
+                journal=journal,
+                gate=gate,
+            )
+        )
+    except ExecutionHandoffContractError as exc:
+        raise FreshPhysicalTargetRevalidationError(
+            "trusted execution handoff is unavailable"
+        ) from exc
+
+    if not _immutable_execution_handoff_integrity_valid(
+        handoff
+    ):
+        raise FreshPhysicalTargetRevalidationError(
+            "execution handoff integrity is invalid"
+        )
+
+    if (
+        handoff.execution_supported
+        is not False
+        or handoff.executor_eligible
+        is not False
+        or handoff.requires_fresh_target_revalidation
+        is not True
+    ):
+        raise FreshPhysicalTargetRevalidationError(
+            "handoff execution boundary is invalid"
+        )
+
+    fresh = (
+        evaluate_current_authorization_prerequisites(
+            request,
+            record,
+        )
+    )
+
+    if (
+        not decision_integrity_valid(fresh)
+        or not decision_is_current(fresh)
+        or fresh.status
+        != STATUS_PREREQUISITES_MET
+        or fresh.reason_codes != ()
+        or fresh.request_hash is None
+        or fresh.record_snapshot_hash is None
+        or fresh.discovery_snapshot_hash is None
+        or fresh.target_binding_hash is None
+        or fresh.target_binding is None
+        or fresh.prerequisite_valid_until_utc
+        is None
+    ):
+        raise FreshPhysicalTargetRevalidationError(
+            "fresh physical-target prerequisites are not positive and current"
+        )
+
+    if (
+        fresh.request_id
+        != handoff.request_id
+        or fresh.request_hash
+        != handoff.request_hash
+        or fresh.record_snapshot_hash
+        != handoff.record_snapshot_hash
+        or request.request_id
+        != handoff.request_id
+        or request_hash(request)
+        != handoff.request_hash
+        or record_snapshot_hash(record)
+        != handoff.record_snapshot_hash
+    ):
+        raise FreshPhysicalTargetRevalidationError(
+            "fresh request or record identity differs from handoff"
+        )
+
+    target = fresh.target_binding
+
+    if not _positive_binding_integrity_valid(
+        target
+    ):
+        raise FreshPhysicalTargetRevalidationError(
+            "fresh physical target binding is not strictly safe"
+        )
+
+    fresh_target_hash = _canonical_hash(
+        asdict(target)
+    )
+
+    if (
+        fresh_target_hash
+        != fresh.target_binding_hash
+        or fresh_target_hash
+        != handoff.target_binding_hash
+    ):
+        raise FreshPhysicalTargetRevalidationError(
+            "fresh physical target binding differs from handoff"
+        )
+
+    if (
+        target.path
+        != handoff.target_path
+        or target.serial
+        != handoff.target_serial
+        or target.wwn
+        != handoff.target_wwn
+        or target.size_bytes
+        != handoff.target_size_bytes
+        or target.model
+        != handoff.target_model
+        or target.transport
+        != handoff.target_transport
+    ):
+        raise FreshPhysicalTargetRevalidationError(
+            "fresh physical target identity facts differ from handoff"
+        )
+
+    if any((
+        target.read_only,
+        target.mounted,
+        target.protected,
+        target.system_protected,
+        target.review_required,
+        target.ambiguous,
+    )):
+        raise FreshPhysicalTargetRevalidationError(
+            "fresh physical target has a safety blocker"
+        )
+
+    policy = get_sanitization_method_policy(
+        request.method_profile_id
+    )
+
+    metadata = (
+        get_sanitization_method_capability_metadata(
+            request.method_profile_id
+        )
+    )
+
+    if (
+        policy is None
+        or metadata is None
+        or policy.method_profile_id
+        != handoff.method_profile_id
+        or metadata.method_profile_id
+        != handoff.method_profile_id
+        or policy.operation
+        != handoff.operation
+        or policy.policy_only is not True
+        or policy.execution_supported is not False
+        or metadata.capability_class
+        != "policy_only"
+    ):
+        raise FreshPhysicalTargetRevalidationError(
+            "trusted method remains outside executable policy"
+        )
+
+    constraints = (
+        evaluate_sanitization_method_constraints(
+            request.method_profile_id,
+            target,
+        )
+    )
+
+    constraint_hash = _canonical_hash(
+        asdict(constraints)
+    )
+
+    if (
+        constraints.status
+        != METHOD_CONSTRAINT_STATUS_SATISFIED
+        or constraints.reason_codes != ()
+        or constraints.method_profile_id
+        != handoff.method_profile_id
+        or constraints.target_binding_hash
+        != fresh_target_hash
+        or constraint_hash
+        != handoff.constraint_evaluation_hash
+    ):
+        raise FreshPhysicalTargetRevalidationError(
+            "fresh method constraints differ from handoff"
+        )
+
+    payload = _fresh_target_revalidation_payload(
+        policy_version=(
+            FRESH_TARGET_REVALIDATION_POLICY_VERSION
+        ),
+        schema_version=(
+            FRESH_TARGET_REVALIDATION_SCHEMA_VERSION
+        ),
+        status=(
+            FRESH_TARGET_REVALIDATION_STATUS_SATISFIED
+        ),
+        handoff_id=handoff.handoff_id,
+        gate_id=handoff.gate_id,
+        binding_id=handoff.binding_id,
+        journal_entry_hash=(
+            handoff.journal_entry_hash
+        ),
+        fresh_prerequisite_decision_id=(
+            fresh.decision_id
+        ),
+        fresh_discovery_snapshot_hash=(
+            fresh.discovery_snapshot_hash
+        ),
+        request_id=fresh.request_id,
+        request_hash=fresh.request_hash,
+        record_snapshot_hash=(
+            fresh.record_snapshot_hash
+        ),
+        method_profile_id=(
+            handoff.method_profile_id
+        ),
+        operation=handoff.operation,
+        prior_target_binding_hash=(
+            handoff.target_binding_hash
+        ),
+        fresh_target_binding_hash=(
+            fresh_target_hash
+        ),
+        constraint_evaluation_hash=(
+            constraint_hash
+        ),
+        target_path=target.path,
+        target_serial=target.serial,
+        target_wwn=target.wwn,
+        target_size_bytes=target.size_bytes,
+        target_model=target.model,
+        target_transport=target.transport,
+        target_read_only=target.read_only,
+        target_mounted=target.mounted,
+        target_protected=target.protected,
+        target_system_protected=(
+            target.system_protected
+        ),
+        target_review_required=(
+            target.review_required
+        ),
+        target_ambiguous=(
+            target.ambiguous
+        ),
+        discovery_captured_at_utc=(
+            fresh.discovery_captured_at_utc
+        ),
+        evaluated_at_utc=(
+            fresh.evaluated_at_utc
+        ),
+        valid_until_utc=(
+            fresh.prerequisite_valid_until_utc
+        ),
+        execution_supported=False,
+        executor_eligible=False,
+        requires_separate_executor_authorization=True,
+    )
+
+    payload_hash = _canonical_hash(
+        payload
+    )
+
+    decision = (
+        FreshPhysicalTargetRevalidationDecision(
+            revalidation_id=(
+                "ptrv_"
+                + payload_hash.split(":", 1)[1]
+            ),
+            policy_version=(
+                FRESH_TARGET_REVALIDATION_POLICY_VERSION
+            ),
+            schema_version=(
+                FRESH_TARGET_REVALIDATION_SCHEMA_VERSION
+            ),
+            status=(
+                FRESH_TARGET_REVALIDATION_STATUS_SATISFIED
+            ),
+            handoff_id=handoff.handoff_id,
+            gate_id=handoff.gate_id,
+            binding_id=handoff.binding_id,
+            journal_entry_hash=(
+                handoff.journal_entry_hash
+            ),
+            fresh_prerequisite_decision_id=(
+                fresh.decision_id
+            ),
+            fresh_discovery_snapshot_hash=(
+                fresh.discovery_snapshot_hash
+            ),
+            request_id=fresh.request_id,
+            request_hash=fresh.request_hash,
+            record_snapshot_hash=(
+                fresh.record_snapshot_hash
+            ),
+            method_profile_id=(
+                handoff.method_profile_id
+            ),
+            operation=handoff.operation,
+            prior_target_binding_hash=(
+                handoff.target_binding_hash
+            ),
+            fresh_target_binding_hash=(
+                fresh_target_hash
+            ),
+            constraint_evaluation_hash=(
+                constraint_hash
+            ),
+            target_path=target.path,
+            target_serial=target.serial,
+            target_wwn=target.wwn,
+            target_size_bytes=target.size_bytes,
+            target_model=target.model,
+            target_transport=(
+                target.transport
+            ),
+            target_read_only=(
+                target.read_only
+            ),
+            target_mounted=target.mounted,
+            target_protected=(
+                target.protected
+            ),
+            target_system_protected=(
+                target.system_protected
+            ),
+            target_review_required=(
+                target.review_required
+            ),
+            target_ambiguous=(
+                target.ambiguous
+            ),
+            discovery_captured_at_utc=(
+                fresh.discovery_captured_at_utc
+            ),
+            evaluated_at_utc=(
+                fresh.evaluated_at_utc
+            ),
+            valid_until_utc=(
+                fresh.prerequisite_valid_until_utc
+            ),
+            execution_supported=False,
+            executor_eligible=False,
+            requires_separate_executor_authorization=True,
+        )
+    )
+
+    if not (
+        _fresh_physical_target_revalidation_integrity_valid(
+            decision
+        )
+    ):
+        raise FreshPhysicalTargetRevalidationError(
+            "constructed fresh target revalidation failed integrity validation"
+        )
+
+    return decision
 __all__ = [
     "APPROVAL_POLICY_VERSION",
     "APPROVAL_CHALLENGE_LIFETIME_SECONDS",
@@ -7460,6 +8350,11 @@ __all__ = [
     "EXECUTION_HANDOFF_POLICY_VERSION",
     "EXECUTION_HANDOFF_SCHEMA_VERSION",
     "EXECUTION_HANDOFF_STATUS_CONTRACT_BUILT",
+    "FreshPhysicalTargetRevalidationDecision",
+    "FreshPhysicalTargetRevalidationError",
+    "FRESH_TARGET_REVALIDATION_POLICY_VERSION",
+    "FRESH_TARGET_REVALIDATION_SCHEMA_VERSION",
+    "FRESH_TARGET_REVALIDATION_STATUS_SATISFIED",
     "AuthorizationDecision",
     "AuthorizationError",
     "AuthorizationRequest",
@@ -7510,6 +8405,7 @@ __all__ = [
     "satisfy_one_shot_execution_gate",
     "satisfy_durable_one_shot_execution_gate",
     "build_immutable_execution_handoff_contract",
+    "revalidate_physical_target_for_execution_handoff",
     "record_snapshot_hash",
     "request_hash",
 ]

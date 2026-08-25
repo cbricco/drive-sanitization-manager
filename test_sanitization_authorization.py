@@ -9473,5 +9473,910 @@ class Phase5AuthorizationR2Tests(unittest.TestCase):
                     source,
                 )
 
+    def _phase6ea_ready(
+        self,
+        directory,
+        *,
+        request_id="PHASE6EA-REQ",
+    ):
+        (
+            registry,
+            record,
+            request,
+            evidence,
+            binding,
+            gate,
+            journal,
+            at,
+        ) = self._phase6dd_completed(
+            directory,
+            request_id=request_id,
+        )
+
+        return (
+            registry,
+            record,
+            request,
+            evidence,
+            binding,
+            gate,
+            journal,
+            self.snapshot(),
+            at,
+        )
+
+    def test_phase6ea_builds_frozen_deterministic_fresh_target_revalidation(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                registry,
+                record,
+                request,
+                evidence,
+                binding,
+                gate,
+                journal,
+                snapshot,
+                at,
+            ) = self._phase6ea_ready(
+                directory,
+                request_id="PHASE6EA-DETERMINISTIC",
+            )
+
+            with (
+                patch(
+                    "sanitization_authorization."
+                    "collect_current_drive_discovery",
+                    return_value=snapshot,
+                ),
+                patch(
+                    "sanitization_authorization._utc_now",
+                    return_value=(
+                        at + timedelta(seconds=3)
+                    ),
+                ),
+            ):
+                first = (
+                    auth.revalidate_physical_target_for_execution_handoff(
+                        registry=registry,
+                        approval_id=evidence.approval_id,
+                        request=request,
+                        record=record,
+                        journal=journal,
+                        gate=gate,
+                    )
+                )
+
+                second = (
+                    auth.revalidate_physical_target_for_execution_handoff(
+                        registry=registry,
+                        approval_id=evidence.approval_id,
+                        request=request,
+                        record=record,
+                        journal=journal,
+                        gate=gate,
+                    )
+                )
+
+            self.assertEqual(
+                first,
+                second,
+            )
+
+            self.assertEqual(
+                first.status,
+                auth.FRESH_TARGET_REVALIDATION_STATUS_SATISFIED,
+            )
+
+            self.assertEqual(
+                first.binding_id,
+                binding.binding_id,
+            )
+
+            self.assertEqual(
+                first.prior_target_binding_hash,
+                first.fresh_target_binding_hash,
+            )
+
+            self.assertFalse(
+                first.execution_supported
+            )
+
+            self.assertFalse(
+                first.executor_eligible
+            )
+
+            self.assertTrue(
+                first.requires_separate_executor_authorization
+            )
+
+            self.assertTrue(
+                auth._fresh_physical_target_revalidation_integrity_valid(
+                    first
+                )
+            )
+
+            with self.assertRaises(
+                FrozenInstanceError
+            ):
+                first.status = "other"
+
+    def test_phase6ea_uses_existing_current_authorization_evaluator_once(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                registry,
+                record,
+                request,
+                evidence,
+                _binding,
+                gate,
+                journal,
+                snapshot,
+                at,
+            ) = self._phase6ea_ready(
+                directory,
+                request_id="PHASE6EA-EVALUATOR",
+            )
+
+            original = (
+                auth.evaluate_current_authorization_prerequisites
+            )
+
+            with (
+                patch(
+                    "sanitization_authorization."
+                    "collect_current_drive_discovery",
+                    return_value=snapshot,
+                ) as collector,
+                patch(
+                    "sanitization_authorization._utc_now",
+                    return_value=(
+                        at + timedelta(seconds=3)
+                    ),
+                ),
+                patch(
+                    "sanitization_authorization."
+                    "evaluate_current_authorization_prerequisites",
+                    wraps=original,
+                ) as evaluator,
+            ):
+                result = (
+                    auth.revalidate_physical_target_for_execution_handoff(
+                        registry=registry,
+                        approval_id=evidence.approval_id,
+                        request=request,
+                        record=record,
+                        journal=journal,
+                        gate=gate,
+                    )
+                )
+
+            self.assertEqual(
+                result.status,
+                auth.FRESH_TARGET_REVALIDATION_STATUS_SATISFIED,
+            )
+
+            self.assertEqual(
+                evaluator.call_count,
+                1,
+            )
+
+            self.assertEqual(
+                collector.call_count,
+                1,
+            )
+
+    def test_phase6ea_rejects_identity_path_or_size_change(
+        self,
+    ):
+        cases = (
+            (
+                "path",
+                lambda: self.snapshot([
+                    self.device(
+                        path="/dev/syn-other"
+                    )
+                ]),
+            ),
+            (
+                "serial",
+                lambda: self.snapshot([
+                    self.device(
+                        serial="SERIAL-OTHER"
+                    )
+                ]),
+            ),
+            (
+                "wwn",
+                lambda: self.snapshot([
+                    self.device(
+                        wwn="WWN-OTHER"
+                    )
+                ]),
+            ),
+            (
+                "size",
+                lambda: self.snapshot([
+                    self.device(
+                        size=1_000_001
+                    )
+                ]),
+            ),
+        )
+
+        for label, snapshot_factory in cases:
+            with self.subTest(label=label):
+                with tempfile.TemporaryDirectory() as directory:
+                    (
+                        registry,
+                        record,
+                        request,
+                        evidence,
+                        _binding,
+                        gate,
+                        journal,
+                        _snapshot,
+                        at,
+                    ) = self._phase6ea_ready(
+                        directory,
+                        request_id=(
+                            "PHASE6EA-IDENTITY-"
+                            + label.upper()
+                        ),
+                    )
+
+                    with (
+                        patch(
+                            "sanitization_authorization."
+                            "collect_current_drive_discovery",
+                            return_value=(
+                                snapshot_factory()
+                            ),
+                        ),
+                        patch(
+                            "sanitization_authorization._utc_now",
+                            return_value=(
+                                at
+                                + timedelta(seconds=3)
+                            ),
+                        ),
+                    ):
+                        with self.assertRaises(
+                            auth.FreshPhysicalTargetRevalidationError
+                        ):
+                            auth.revalidate_physical_target_for_execution_handoff(
+                                registry=registry,
+                                approval_id=evidence.approval_id,
+                                request=request,
+                                record=record,
+                                journal=journal,
+                                gate=gate,
+                            )
+
+    def test_phase6ea_rejects_model_or_transport_change(
+        self,
+    ):
+        cases = (
+            (
+                "model",
+                self.snapshot([
+                    self.device(
+                        model="Different Model"
+                    )
+                ]),
+            ),
+            (
+                "transport",
+                self.snapshot([
+                    self.device(
+                        transport="sata"
+                    )
+                ]),
+            ),
+        )
+
+        for label, snapshot in cases:
+            with self.subTest(label=label):
+                with tempfile.TemporaryDirectory() as directory:
+                    (
+                        registry,
+                        record,
+                        request,
+                        evidence,
+                        _binding,
+                        gate,
+                        journal,
+                        _snapshot,
+                        at,
+                    ) = self._phase6ea_ready(
+                        directory,
+                        request_id=(
+                            "PHASE6EA-METADATA-"
+                            + label.upper()
+                        ),
+                    )
+
+                    with (
+                        patch(
+                            "sanitization_authorization."
+                            "collect_current_drive_discovery",
+                            return_value=snapshot,
+                        ),
+                        patch(
+                            "sanitization_authorization._utc_now",
+                            return_value=(
+                                at
+                                + timedelta(seconds=3)
+                            ),
+                        ),
+                    ):
+                        with self.assertRaises(
+                            auth.FreshPhysicalTargetRevalidationError
+                        ):
+                            auth.revalidate_physical_target_for_execution_handoff(
+                                registry=registry,
+                                approval_id=evidence.approval_id,
+                                request=request,
+                                record=record,
+                                journal=journal,
+                                gate=gate,
+                            )
+
+    def test_phase6ea_rejects_new_unsafe_physical_state(
+        self,
+    ):
+        cases = (
+            (
+                "read_only",
+                self.snapshot([
+                    self.device(
+                        read_only=True
+                    )
+                ]),
+            ),
+            (
+                "mounted",
+                self.snapshot([
+                    self.device(
+                        mountpoints=[
+                            "/mnt/phase6ea"
+                        ]
+                    )
+                ]),
+            ),
+            (
+                "protected",
+                self.snapshot(
+                    protected_sources=(
+                        "/dev/syn-a",
+                    )
+                ),
+            ),
+        )
+
+        for label, snapshot in cases:
+            with self.subTest(label=label):
+                with tempfile.TemporaryDirectory() as directory:
+                    (
+                        registry,
+                        record,
+                        request,
+                        evidence,
+                        _binding,
+                        gate,
+                        journal,
+                        _snapshot,
+                        at,
+                    ) = self._phase6ea_ready(
+                        directory,
+                        request_id=(
+                            "PHASE6EA-UNSAFE-"
+                            + label.upper()
+                        ),
+                    )
+
+                    with (
+                        patch(
+                            "sanitization_authorization."
+                            "collect_current_drive_discovery",
+                            return_value=snapshot,
+                        ),
+                        patch(
+                            "sanitization_authorization._utc_now",
+                            return_value=(
+                                at
+                                + timedelta(seconds=3)
+                            ),
+                        ),
+                    ):
+                        with self.assertRaises(
+                            auth.FreshPhysicalTargetRevalidationError
+                        ):
+                            auth.revalidate_physical_target_for_execution_handoff(
+                                registry=registry,
+                                approval_id=evidence.approval_id,
+                                request=request,
+                                record=record,
+                                journal=journal,
+                                gate=gate,
+                            )
+
+    def test_phase6ea_discovery_failure_or_stale_request_fails_closed(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                registry,
+                record,
+                request,
+                evidence,
+                _binding,
+                gate,
+                journal,
+                snapshot,
+                at,
+            ) = self._phase6ea_ready(
+                directory,
+                request_id="PHASE6EA-FAIL-CLOSED",
+            )
+
+            with (
+                patch(
+                    "sanitization_authorization."
+                    "collect_current_drive_discovery",
+                    side_effect=(
+                        auth.DiscoveryCollectionError(
+                            "synthetic collection failure"
+                        )
+                    ),
+                ),
+                patch(
+                    "sanitization_authorization._utc_now",
+                    return_value=(
+                        at + timedelta(seconds=3)
+                    ),
+                ),
+            ):
+                with self.assertRaises(
+                    auth.FreshPhysicalTargetRevalidationError
+                ):
+                    auth.revalidate_physical_target_for_execution_handoff(
+                        registry=registry,
+                        approval_id=evidence.approval_id,
+                        request=request,
+                        record=record,
+                        journal=journal,
+                        gate=gate,
+                    )
+
+            with (
+                patch(
+                    "sanitization_authorization."
+                    "collect_current_drive_discovery",
+                    return_value=snapshot,
+                ),
+                patch(
+                    "sanitization_authorization._utc_now",
+                    return_value=(
+                        at + timedelta(seconds=400)
+                    ),
+                ),
+            ):
+                with self.assertRaises(
+                    auth.FreshPhysicalTargetRevalidationError
+                ):
+                    auth.revalidate_physical_target_for_execution_handoff(
+                        registry=registry,
+                        approval_id=evidence.approval_id,
+                        request=request,
+                        record=record,
+                        journal=journal,
+                        gate=gate,
+                    )
+
+    def test_phase6ea_rejects_gate_or_journal_provenance_failure(
+        self,
+    ):
+        for mode in (
+            "gate",
+            "journal",
+        ):
+            with self.subTest(mode=mode):
+                with tempfile.TemporaryDirectory() as directory:
+                    (
+                        registry,
+                        record,
+                        request,
+                        evidence,
+                        _binding,
+                        gate,
+                        journal,
+                        snapshot,
+                        at,
+                    ) = self._phase6ea_ready(
+                        directory,
+                        request_id=(
+                            "PHASE6EA-PROVENANCE-"
+                            + mode.upper()
+                        ),
+                    )
+
+                    candidate_gate = gate
+                    candidate_journal = journal
+
+                    if mode == "gate":
+                        candidate_gate = replace(
+                            gate,
+                            gate_id=(
+                                "xgate_"
+                                + ("0" * 64)
+                            ),
+                        )
+                    else:
+                        candidate_journal = (
+                            auth.DurableExecutionGateConsumptionJournal(
+                                Path(directory)
+                                / "empty-journal.json"
+                            )
+                        )
+
+                    with (
+                        patch(
+                            "sanitization_authorization."
+                            "collect_current_drive_discovery",
+                            return_value=snapshot,
+                        ) as collector,
+                        patch(
+                            "sanitization_authorization._utc_now",
+                            return_value=(
+                                at
+                                + timedelta(seconds=3)
+                            ),
+                        ),
+                    ):
+                        with self.assertRaises(
+                            auth.FreshPhysicalTargetRevalidationError
+                        ):
+                            auth.revalidate_physical_target_for_execution_handoff(
+                                registry=registry,
+                                approval_id=evidence.approval_id,
+                                request=request,
+                                record=record,
+                                journal=candidate_journal,
+                                gate=candidate_gate,
+                            )
+
+                    self.assertEqual(
+                        collector.call_count,
+                        0,
+                    )
+
+    def test_phase6ea_rejects_untrusted_method_registry(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                registry,
+                record,
+                request,
+                evidence,
+                _binding,
+                gate,
+                journal,
+                snapshot,
+                at,
+            ) = self._phase6ea_ready(
+                directory,
+                request_id="PHASE6EA-METHOD",
+            )
+
+            with (
+                patch.object(
+                    auth,
+                    "_SANITIZATION_METHOD_CAPABILITIES",
+                    (),
+                ),
+                patch(
+                    "sanitization_authorization."
+                    "collect_current_drive_discovery",
+                    return_value=snapshot,
+                ) as collector,
+                patch(
+                    "sanitization_authorization._utc_now",
+                    return_value=(
+                        at + timedelta(seconds=3)
+                    ),
+                ),
+            ):
+                with self.assertRaises(
+                    auth.FreshPhysicalTargetRevalidationError
+                ):
+                    auth.revalidate_physical_target_for_execution_handoff(
+                        registry=registry,
+                        approval_id=evidence.approval_id,
+                        request=request,
+                        record=record,
+                        journal=journal,
+                        gate=gate,
+                    )
+
+            self.assertEqual(
+                collector.call_count,
+                0,
+            )
+
+    def test_phase6ea_integrity_binds_fresh_snapshot_and_detects_tampering(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                registry,
+                record,
+                request,
+                evidence,
+                _binding,
+                gate,
+                journal,
+                snapshot,
+                at,
+            ) = self._phase6ea_ready(
+                directory,
+                request_id="PHASE6EA-INTEGRITY",
+            )
+
+            with (
+                patch(
+                    "sanitization_authorization."
+                    "collect_current_drive_discovery",
+                    return_value=snapshot,
+                ),
+                patch(
+                    "sanitization_authorization._utc_now",
+                    return_value=(
+                        at + timedelta(seconds=3)
+                    ),
+                ),
+            ):
+                decision = (
+                    auth.revalidate_physical_target_for_execution_handoff(
+                        registry=registry,
+                        approval_id=evidence.approval_id,
+                        request=request,
+                        record=record,
+                        journal=journal,
+                        gate=gate,
+                    )
+                )
+
+            self.assertEqual(
+                decision.fresh_discovery_snapshot_hash,
+                auth.discovery_snapshot_hash(
+                    snapshot
+                ),
+            )
+
+            self.assertTrue(
+                auth._fresh_physical_target_revalidation_integrity_valid(
+                    decision
+                )
+            )
+
+            cases = (
+                replace(
+                    decision,
+                    revalidation_id=(
+                        "ptrv_" + ("0" * 64)
+                    ),
+                ),
+                replace(
+                    decision,
+                    fresh_target_binding_hash=(
+                        "sha256:" + ("1" * 64)
+                    ),
+                ),
+                replace(
+                    decision,
+                    target_transport="sata",
+                ),
+                replace(
+                    decision,
+                    target_read_only=True,
+                ),
+                replace(
+                    decision,
+                    executor_eligible=True,
+                ),
+                replace(
+                    decision,
+                    requires_separate_executor_authorization=False,
+                ),
+            )
+
+            for candidate in cases:
+                with self.subTest(
+                    candidate=candidate
+                ):
+                    self.assertFalse(
+                        auth._fresh_physical_target_revalidation_integrity_valid(
+                            candidate
+                        )
+                    )
+
+    def test_phase6ea_surface_is_read_only_non_executing_and_non_authorizing(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                registry,
+                record,
+                request,
+                evidence,
+                _binding,
+                gate,
+                journal,
+                snapshot,
+                at,
+            ) = self._phase6ea_ready(
+                directory,
+                request_id="PHASE6EA-SURFACE",
+            )
+
+            journal_before = (
+                journal.path.read_bytes()
+            )
+
+            consumed_before = set(
+                registry._consumed_execution_bindings
+            )
+
+            signature = inspect.signature(
+                auth.revalidate_physical_target_for_execution_handoff
+            )
+
+            self.assertEqual(
+                tuple(signature.parameters),
+                (
+                    "registry",
+                    "approval_id",
+                    "request",
+                    "record",
+                    "journal",
+                    "gate",
+                ),
+            )
+
+            with (
+                patch(
+                    "sanitization_authorization."
+                    "collect_current_drive_discovery",
+                    return_value=snapshot,
+                ),
+                patch(
+                    "sanitization_authorization._utc_now",
+                    return_value=(
+                        at + timedelta(seconds=3)
+                    ),
+                ),
+            ):
+                result = (
+                    auth.revalidate_physical_target_for_execution_handoff(
+                        registry=registry,
+                        approval_id=evidence.approval_id,
+                        request=request,
+                        record=record,
+                        journal=journal,
+                        gate=gate,
+                    )
+                )
+
+            self.assertEqual(
+                journal.path.read_bytes(),
+                journal_before,
+            )
+
+            self.assertEqual(
+                registry._consumed_execution_bindings,
+                consumed_before,
+            )
+
+            self.assertFalse(
+                result.execution_supported
+            )
+
+            self.assertFalse(
+                result.executor_eligible
+            )
+
+            self.assertTrue(
+                result.requires_separate_executor_authorization
+            )
+
+            field_names = {
+                field.name
+                for field in fields(
+                    auth.FreshPhysicalTargetRevalidationDecision
+                )
+            }
+
+            for forbidden in (
+                "approved",
+                "authorized",
+                "command",
+                "executable",
+                "executor",
+                "callback",
+                "device_handle",
+                "argv",
+                "arguments",
+                "shell",
+                "wipe",
+                "success",
+            ):
+                self.assertNotIn(
+                    forbidden,
+                    field_names,
+                )
+
+            source = inspect.getsource(
+                auth.revalidate_physical_target_for_execution_handoff
+            )
+
+            ast_module = __import__("ast")
+            parsed_source = ast_module.parse(source)
+
+            evaluator_call_count = sum(
+                1
+                for node in ast_module.walk(
+                    parsed_source
+                )
+                if (
+                    isinstance(
+                        node,
+                        ast_module.Call,
+                    )
+                    and isinstance(
+                        node.func,
+                        ast_module.Name,
+                    )
+                    and node.func.id
+                    == "evaluate_current_authorization_prerequisites"
+                )
+            )
+
+            self.assertEqual(
+                evaluator_call_count,
+                1,
+            )
+
+            for forbidden_call in (
+                "collect_current_drive_discovery(",
+                "record_human_approval(",
+                "revalidate_approval(",
+                "satisfy_one_shot_execution_gate(",
+                "satisfy_durable_one_shot_execution_gate(",
+                "_reserve(",
+                "_complete(",
+                "_rollback_reservation(",
+                "subprocess.",
+                "os.system(",
+                "Popen(",
+                "shell=True",
+                "exec(",
+                "eval(",
+                "write_text(",
+                "write_bytes(",
+                "wipefs",
+                "blkdiscard",
+                "shred",
+                "hdparm",
+            ):
+                self.assertNotIn(
+                    forbidden_call,
+                    source,
+                )
+
 if __name__ == "__main__":
     unittest.main()
