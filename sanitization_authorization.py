@@ -116,6 +116,197 @@ def get_sanitization_method_policy(
 
     return None
 
+@dataclass(frozen=True)
+class SanitizationMethodCapabilityMetadata:
+    """Non-executable capability and safety-constraint metadata."""
+
+    method_profile_id: str
+    capability_class: str
+    requires_strong_identity: bool
+    requires_unmounted: bool
+    requires_writable: bool
+    requires_unprotected: bool
+    requires_non_system_target: bool
+    requires_unambiguous_target: bool
+    requires_no_review_required: bool
+    verification_expectation: str
+
+
+_METHOD_CAPABILITY_CLASSES = frozenset({
+    "policy_only",
+})
+
+_METHOD_VERIFICATION_EXPECTATIONS = frozenset({
+    "not_applicable",
+})
+
+
+_SANITIZATION_METHOD_CAPABILITIES = (
+    SanitizationMethodCapabilityMetadata(
+        method_profile_id="phase5-policy-only",
+        capability_class="policy_only",
+        requires_strong_identity=True,
+        requires_unmounted=True,
+        requires_writable=True,
+        requires_unprotected=True,
+        requires_non_system_target=True,
+        requires_unambiguous_target=True,
+        requires_no_review_required=True,
+        verification_expectation="not_applicable",
+    ),
+)
+
+
+def _method_capability_text(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and value == value.strip()
+        and not any(
+            ord(character) < 32
+            or ord(character) == 127
+            for character in value
+        )
+    )
+
+
+def _sanitization_method_capability_metadata_valid(
+    metadata: Any,
+) -> bool:
+    if not isinstance(
+        metadata,
+        SanitizationMethodCapabilityMetadata,
+    ):
+        return False
+
+    if not _method_capability_text(
+        metadata.method_profile_id
+    ):
+        return False
+
+    if (
+        metadata.capability_class
+        not in _METHOD_CAPABILITY_CLASSES
+    ):
+        return False
+
+    if (
+        metadata.verification_expectation
+        not in _METHOD_VERIFICATION_EXPECTATIONS
+    ):
+        return False
+
+    constraint_values = (
+        metadata.requires_strong_identity,
+        metadata.requires_unmounted,
+        metadata.requires_writable,
+        metadata.requires_unprotected,
+        metadata.requires_non_system_target,
+        metadata.requires_unambiguous_target,
+        metadata.requires_no_review_required,
+    )
+
+    if any(
+        type(value) is not bool
+        for value in constraint_values
+    ):
+        return False
+
+    if metadata.capability_class == "policy_only":
+        return (
+            all(constraint_values)
+            and metadata.verification_expectation
+            == "not_applicable"
+        )
+
+    return False
+
+
+def _sanitization_method_capability_registry_valid() -> bool:
+    if (
+        not isinstance(
+            _SANITIZATION_METHOD_POLICIES,
+            tuple,
+        )
+        or not _SANITIZATION_METHOD_POLICIES
+        or not isinstance(
+            _SANITIZATION_METHOD_CAPABILITIES,
+            tuple,
+        )
+        or not _SANITIZATION_METHOD_CAPABILITIES
+    ):
+        return False
+
+    policy_ids = []
+
+    for policy in _SANITIZATION_METHOD_POLICIES:
+        if not isinstance(
+            policy,
+            SanitizationMethodPolicy,
+        ):
+            return False
+
+        if not _method_capability_text(
+            policy.method_profile_id
+        ):
+            return False
+
+        if policy.method_profile_id in policy_ids:
+            return False
+
+        if (
+            policy.operation not in SUPPORTED_OPERATIONS
+            or type(policy.policy_only) is not bool
+            or type(policy.execution_supported) is not bool
+            or policy.policy_only is not True
+            or policy.execution_supported is not False
+        ):
+            return False
+
+        policy_ids.append(
+            policy.method_profile_id
+        )
+
+    capability_ids = []
+
+    for metadata in _SANITIZATION_METHOD_CAPABILITIES:
+        if not _sanitization_method_capability_metadata_valid(
+            metadata
+        ):
+            return False
+
+        if metadata.method_profile_id in capability_ids:
+            return False
+
+        capability_ids.append(
+            metadata.method_profile_id
+        )
+
+    return (
+        set(policy_ids) == set(capability_ids)
+        and len(policy_ids) == len(capability_ids)
+    )
+
+
+def get_sanitization_method_capability_metadata(
+    method_profile_id: Any,
+) -> Optional[SanitizationMethodCapabilityMetadata]:
+    """Return metadata for one exact trusted method-profile identifier."""
+
+    if not _method_capability_text(
+        method_profile_id
+    ):
+        return None
+
+    if not _sanitization_method_capability_registry_valid():
+        return None
+
+    for metadata in _SANITIZATION_METHOD_CAPABILITIES:
+        if metadata.method_profile_id == method_profile_id:
+            return metadata
+
+    return None
+
 
 class AuthorizationError(ValueError):
     """Authorization request or evidence could not be safely interpreted."""
@@ -2775,6 +2966,7 @@ __all__ = [
     "AuthorizationRequest",
     "TargetIdentityBinding",
     "SanitizationMethodPolicy",
+    "SanitizationMethodCapabilityMetadata",
     "POLICY_VERSION",
     "SCHEMA_VERSION",
     "EVIDENCE_ORIGIN",
@@ -2792,6 +2984,7 @@ __all__ = [
     "discovery_snapshot_hash",
     "evaluate_current_authorization_prerequisites",
     "get_sanitization_method_policy",
+    "get_sanitization_method_capability_metadata",
     "record_snapshot_hash",
     "request_hash",
 ]

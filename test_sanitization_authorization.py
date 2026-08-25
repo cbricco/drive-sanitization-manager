@@ -4637,5 +4637,298 @@ class Phase5AuthorizationR2Tests(unittest.TestCase):
                     "METHOD_PROFILE_OPERATION_MISMATCH",
                 )
 
+    def test_phase6bb_capability_metadata_is_exact(
+        self,
+    ):
+        metadata = (
+            auth.get_sanitization_method_capability_metadata(
+                "phase5-policy-only"
+            )
+        )
+
+        self.assertIsInstance(
+            metadata,
+            auth.SanitizationMethodCapabilityMetadata,
+        )
+
+        self.assertEqual(
+            [field.name for field in fields(
+                auth.SanitizationMethodCapabilityMetadata
+            )],
+            [
+                "method_profile_id",
+                "capability_class",
+                "requires_strong_identity",
+                "requires_unmounted",
+                "requires_writable",
+                "requires_unprotected",
+                "requires_non_system_target",
+                "requires_unambiguous_target",
+                "requires_no_review_required",
+                "verification_expectation",
+            ],
+        )
+
+        self.assertEqual(
+            metadata.method_profile_id,
+            "phase5-policy-only",
+        )
+
+        self.assertEqual(
+            metadata.capability_class,
+            "policy_only",
+        )
+
+        self.assertTrue(
+            metadata.requires_strong_identity
+        )
+        self.assertTrue(
+            metadata.requires_unmounted
+        )
+        self.assertTrue(
+            metadata.requires_writable
+        )
+        self.assertTrue(
+            metadata.requires_unprotected
+        )
+        self.assertTrue(
+            metadata.requires_non_system_target
+        )
+        self.assertTrue(
+            metadata.requires_unambiguous_target
+        )
+        self.assertTrue(
+            metadata.requires_no_review_required
+        )
+
+        self.assertEqual(
+            metadata.verification_expectation,
+            "not_applicable",
+        )
+
+    def test_phase6bb_capability_metadata_is_frozen(
+        self,
+    ):
+        metadata = (
+            auth.get_sanitization_method_capability_metadata(
+                "phase5-policy-only"
+            )
+        )
+
+        self.assertIsNotNone(metadata)
+
+        with self.assertRaises(FrozenInstanceError):
+            metadata.requires_writable = False
+
+    def test_phase6bb_capability_lookup_is_exact_and_deterministic(
+        self,
+    ):
+        first = (
+            auth.get_sanitization_method_capability_metadata(
+                "phase5-policy-only"
+            )
+        )
+
+        second = (
+            auth.get_sanitization_method_capability_metadata(
+                "phase5-policy-only"
+            )
+        )
+
+        self.assertIsNotNone(first)
+        self.assertIs(first, second)
+
+        for invalid in (
+            None,
+            True,
+            0,
+            b"phase5-policy-only",
+            "",
+            "   ",
+            "phase5-policy-only ",
+            " phase5-policy-only",
+            "PHASE5-POLICY-ONLY",
+            "phase5-\npolicy-only",
+            "unknown",
+        ):
+            with self.subTest(invalid=repr(invalid)):
+                self.assertIsNone(
+                    auth.get_sanitization_method_capability_metadata(
+                        invalid
+                    )
+                )
+
+    def test_phase6bb_capability_metadata_validation_fails_closed(
+        self,
+    ):
+        metadata = (
+            auth.get_sanitization_method_capability_metadata(
+                "phase5-policy-only"
+            )
+        )
+
+        self.assertIsNotNone(metadata)
+
+        malformed = (
+            replace(
+                metadata,
+                capability_class="unknown",
+            ),
+            replace(
+                metadata,
+                requires_writable=False,
+            ),
+            replace(
+                metadata,
+                requires_writable=1,
+            ),
+            replace(
+                metadata,
+                requires_unmounted=False,
+            ),
+            replace(
+                metadata,
+                verification_expectation="required",
+            ),
+            replace(
+                metadata,
+                method_profile_id="phase5-policy-only ",
+            ),
+        )
+
+        for candidate in malformed:
+            with self.subTest(candidate=candidate):
+                self.assertFalse(
+                    auth._sanitization_method_capability_metadata_valid(
+                        candidate
+                    )
+                )
+
+    def test_phase6bb_duplicate_or_missing_capability_registry_fails_closed(
+        self,
+    ):
+        metadata = (
+            auth.get_sanitization_method_capability_metadata(
+                "phase5-policy-only"
+            )
+        )
+
+        self.assertIsNotNone(metadata)
+
+        for registry in (
+            (),
+            (metadata, metadata),
+            (
+                replace(
+                    metadata,
+                    method_profile_id="unknown",
+                ),
+            ),
+        ):
+            with self.subTest(registry=registry):
+                with patch.object(
+                    auth,
+                    "_SANITIZATION_METHOD_CAPABILITIES",
+                    registry,
+                ):
+                    self.assertFalse(
+                        auth._sanitization_method_capability_registry_valid()
+                    )
+
+                    self.assertIsNone(
+                        auth.get_sanitization_method_capability_metadata(
+                            "phase5-policy-only"
+                        )
+                    )
+
+    def test_phase6bb_capability_registry_requires_exact_policy_binding(
+        self,
+    ):
+        metadata = (
+            auth.get_sanitization_method_capability_metadata(
+                "phase5-policy-only"
+            )
+        )
+
+        policy = auth.get_sanitization_method_policy(
+            "phase5-policy-only"
+        )
+
+        self.assertIsNotNone(metadata)
+        self.assertIsNotNone(policy)
+
+        self.assertTrue(
+            auth._sanitization_method_capability_registry_valid()
+        )
+
+        with patch.object(
+            auth,
+            "_SANITIZATION_METHOD_POLICIES",
+            (policy, policy),
+        ):
+            self.assertFalse(
+                auth._sanitization_method_capability_registry_valid()
+            )
+
+            self.assertIsNone(
+                auth.get_sanitization_method_capability_metadata(
+                    "phase5-policy-only"
+                )
+            )
+
+    def test_phase6bb_capability_metadata_has_no_execution_surface(
+        self,
+    ):
+        metadata = (
+            auth.get_sanitization_method_capability_metadata(
+                "phase5-policy-only"
+            )
+        )
+
+        self.assertIsNotNone(metadata)
+
+        field_names = {
+            field.name
+            for field in fields(
+                auth.SanitizationMethodCapabilityMetadata
+            )
+        }
+
+        for forbidden in (
+            "command",
+            "executable",
+            "callback",
+            "function",
+            "handler",
+            "device",
+            "path",
+            "executor",
+            "arguments",
+            "argv",
+            "shell",
+        ):
+            self.assertNotIn(
+                forbidden,
+                field_names,
+            )
+
+        lookup_source = inspect.getsource(
+            auth.get_sanitization_method_capability_metadata
+        )
+
+        for forbidden in (
+            "subprocess",
+            "os.system",
+            "Popen",
+            "shell=True",
+            "exec(",
+            "eval(",
+            "/dev/",
+        ):
+            self.assertNotIn(
+                forbidden,
+                lookup_source,
+            )
+
 if __name__ == "__main__":
     unittest.main()
