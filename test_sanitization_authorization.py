@@ -6873,5 +6873,586 @@ class Phase5AuthorizationR2Tests(unittest.TestCase):
                 source,
             )
 
+    def _phase6da_success(
+        self,
+        *,
+        request_id="PHASE6DA-REQ",
+    ):
+        (
+            registry,
+            record,
+            request,
+            challenge,
+            evidence,
+            snapshot,
+            at,
+        ) = self._phase6a2_start_approval(
+            request_id=request_id
+        )
+
+        result = self._phase6a2_revalidate(
+            registry,
+            evidence,
+            request,
+            record,
+            snapshot,
+            at=at + timedelta(seconds=1),
+        )
+
+        self.assertEqual(
+            result.status,
+            auth.APPROVAL_STATUS_REVALIDATED,
+        )
+        self.assertEqual(
+            result.reason_codes,
+            (),
+        )
+
+        return (
+            registry,
+            record,
+            request,
+            challenge,
+            evidence,
+            result,
+            snapshot,
+            at,
+        )
+
+    def test_phase6da_builds_exact_frozen_deterministic_trusted_binding(
+        self,
+    ):
+        (
+            registry,
+            record,
+            request,
+            challenge,
+            evidence,
+            revalidation,
+            _snapshot,
+            _at,
+        ) = self._phase6da_success()
+
+        first = auth.build_trusted_execution_binding(
+            registry=registry,
+            approval_id=evidence.approval_id,
+            request=request,
+            record=record,
+        )
+
+        second = auth.build_trusted_execution_binding(
+            registry=registry,
+            approval_id=evidence.approval_id,
+            request=request,
+            record=record,
+        )
+
+        self.assertEqual(first, second)
+
+        self.assertEqual(
+            first.status,
+            auth.EXECUTION_BINDING_STATUS_SATISFIED,
+        )
+        self.assertEqual(
+            first.approval_id,
+            evidence.approval_id,
+        )
+        self.assertEqual(
+            first.challenge_id,
+            challenge.challenge_id,
+        )
+        self.assertEqual(
+            first.approval_evidence_hash,
+            evidence.evidence_hash,
+        )
+        self.assertEqual(
+            first.revalidation_id,
+            revalidation.revalidation_id,
+        )
+        self.assertEqual(
+            first.request_hash,
+            auth.request_hash(request),
+        )
+        self.assertEqual(
+            first.record_snapshot_hash,
+            auth.record_snapshot_hash(record),
+        )
+        self.assertEqual(
+            first.method_profile_id,
+            request.method_profile_id,
+        )
+        self.assertEqual(
+            first.operation,
+            request.operation,
+        )
+
+        self.assertTrue(
+            auth._trusted_execution_binding_integrity_valid(
+                first
+            )
+        )
+
+        with self.assertRaises(FrozenInstanceError):
+            first.status = "other"
+
+    def test_phase6da_registry_public_surface_unchanged_and_success_is_privately_retained(
+        self,
+    ):
+        (
+            registry,
+            _record,
+            _request,
+            _challenge,
+            evidence,
+            revalidation,
+            _snapshot,
+            _at,
+        ) = self._phase6da_success(
+            request_id="PHASE6DA-PRIVATE-STORE"
+        )
+
+        public_methods = {
+            name
+            for name, value
+            in inspect.getmembers(
+                auth.ApprovalRegistry,
+                predicate=inspect.isfunction,
+            )
+            if not name.startswith("_")
+        }
+
+        self.assertEqual(
+            public_methods,
+            {
+                "create_challenge",
+                "record_human_approval",
+                "revalidate_approval",
+            },
+        )
+
+        self.assertIn(
+            evidence.approval_id,
+            registry._successful_revalidations,
+        )
+
+        stored_revalidation, fresh = (
+            registry._successful_revalidations[
+                evidence.approval_id
+            ]
+        )
+
+        self.assertEqual(
+            stored_revalidation,
+            revalidation,
+        )
+        self.assertIsInstance(
+            fresh,
+            auth.AuthorizationDecision,
+        )
+        self.assertEqual(
+            fresh.decision_id,
+            revalidation.fresh_prerequisite_decision_id,
+        )
+
+    def test_phase6da_failed_revalidation_is_not_retained_or_bindable(
+        self,
+    ):
+        (
+            registry,
+            record,
+            request,
+            _challenge,
+            evidence,
+            _snapshot,
+            at,
+        ) = self._phase6a2_start_approval(
+            request_id="PHASE6DA-FAILED"
+        )
+
+        unsafe = self.snapshot([
+            self.device(
+                mountpoints=["/mnt/phase6da"]
+            )
+        ])
+
+        failed = self._phase6a2_revalidate(
+            registry,
+            evidence,
+            request,
+            record,
+            unsafe,
+            at=at + timedelta(seconds=1),
+        )
+
+        self.assertEqual(
+            failed.status,
+            auth.APPROVAL_STATUS_REVALIDATION_FAILED,
+        )
+
+        self.assertNotIn(
+            evidence.approval_id,
+            registry._successful_revalidations,
+        )
+
+        with self.assertRaises(
+            auth.TrustedExecutionBindingError
+        ):
+            auth.build_trusted_execution_binding(
+                registry=registry,
+                approval_id=evidence.approval_id,
+                request=request,
+                record=record,
+            )
+
+    def test_phase6da_rejects_changed_request_identity_or_method(
+        self,
+    ):
+        (
+            registry,
+            record,
+            request,
+            _challenge,
+            evidence,
+            _revalidation,
+            _snapshot,
+            _at,
+        ) = self._phase6da_success(
+            request_id="PHASE6DA-REQUEST-BINDING"
+        )
+
+        cases = (
+            replace(
+                request,
+                request_id="PHASE6DA-OTHER",
+            ),
+            replace(
+                request,
+                method_profile_id="unknown",
+            ),
+            replace(
+                request,
+                operation="sanitize ",
+            ),
+        )
+
+        for changed in cases:
+            with self.subTest(changed=changed):
+                with self.assertRaises(
+                    auth.TrustedExecutionBindingError
+                ):
+                    auth.build_trusted_execution_binding(
+                        registry=registry,
+                        approval_id=evidence.approval_id,
+                        request=changed,
+                        record=record,
+                    )
+
+    def test_phase6da_rejects_changed_record_snapshot(
+        self,
+    ):
+        (
+            registry,
+            record,
+            request,
+            _challenge,
+            evidence,
+            _revalidation,
+            _snapshot,
+            _at,
+        ) = self._phase6da_success(
+            request_id="PHASE6DA-RECORD-BINDING"
+        )
+
+        changed = replace(
+            record,
+            intended_action="different-action",
+        )
+
+        with self.assertRaises(
+            auth.TrustedExecutionBindingError
+        ):
+            auth.build_trusted_execution_binding(
+                registry=registry,
+                approval_id=evidence.approval_id,
+                request=request,
+                record=changed,
+            )
+
+    def test_phase6da_rejects_registry_provenance_tampering(
+        self,
+    ):
+        cases = (
+            "approval_removed",
+            "challenge_unapproved",
+            "approval_unconsumed",
+            "success_removed",
+        )
+
+        for label in cases:
+            with self.subTest(label=label):
+                (
+                    registry,
+                    record,
+                    request,
+                    challenge,
+                    evidence,
+                    _revalidation,
+                    _snapshot,
+                    _at,
+                ) = self._phase6da_success(
+                    request_id=(
+                        "PHASE6DA-PROVENANCE-"
+                        + label
+                    )
+                )
+
+                if label == "approval_removed":
+                    registry._approvals.pop(
+                        evidence.approval_id
+                    )
+                elif label == "challenge_unapproved":
+                    registry._approved_challenges.remove(
+                        challenge.challenge_id
+                    )
+                elif label == "approval_unconsumed":
+                    registry._consumed_approvals.remove(
+                        evidence.approval_id
+                    )
+                elif label == "success_removed":
+                    registry._successful_revalidations.pop(
+                        evidence.approval_id
+                    )
+
+                with self.assertRaises(
+                    auth.TrustedExecutionBindingError
+                ):
+                    auth.build_trusted_execution_binding(
+                        registry=registry,
+                        approval_id=evidence.approval_id,
+                        request=request,
+                        record=record,
+                    )
+
+    def test_phase6da_rejects_tampered_retained_revalidation(
+        self,
+    ):
+        (
+            registry,
+            record,
+            request,
+            _challenge,
+            evidence,
+            revalidation,
+            _snapshot,
+            _at,
+        ) = self._phase6da_success(
+            request_id="PHASE6DA-TAMPER-REVALIDATION"
+        )
+
+        _, fresh = (
+            registry._successful_revalidations[
+                evidence.approval_id
+            ]
+        )
+
+        tampered = replace(
+            revalidation,
+            status=(
+                auth.APPROVAL_STATUS_REVALIDATION_FAILED
+            ),
+        )
+
+        registry._successful_revalidations[
+            evidence.approval_id
+        ] = (
+            tampered,
+            fresh,
+        )
+
+        with self.assertRaises(
+            auth.TrustedExecutionBindingError
+        ):
+            auth.build_trusted_execution_binding(
+                registry=registry,
+                approval_id=evidence.approval_id,
+                request=request,
+                record=record,
+            )
+
+    def test_phase6da_rejects_tampered_retained_fresh_decision(
+        self,
+    ):
+        (
+            registry,
+            record,
+            request,
+            _challenge,
+            evidence,
+            revalidation,
+            _snapshot,
+            _at,
+        ) = self._phase6da_success(
+            request_id="PHASE6DA-TAMPER-FRESH"
+        )
+
+        _, fresh = (
+            registry._successful_revalidations[
+                evidence.approval_id
+            ]
+        )
+
+        unsafe_binding = replace(
+            fresh.target_binding,
+            mounted=True,
+        )
+
+        tampered_fresh = replace(
+            fresh,
+            target_binding=unsafe_binding,
+        )
+
+        registry._successful_revalidations[
+            evidence.approval_id
+        ] = (
+            revalidation,
+            tampered_fresh,
+        )
+
+        with self.assertRaises(
+            auth.TrustedExecutionBindingError
+        ):
+            auth.build_trusted_execution_binding(
+                registry=registry,
+                approval_id=evidence.approval_id,
+                request=request,
+                record=record,
+            )
+
+    def test_phase6da_fails_closed_when_method_registry_is_untrusted(
+        self,
+    ):
+        (
+            registry,
+            record,
+            request,
+            _challenge,
+            evidence,
+            _revalidation,
+            _snapshot,
+            _at,
+        ) = self._phase6da_success(
+            request_id="PHASE6DA-METHOD-REGISTRY"
+        )
+
+        with patch.object(
+            auth,
+            "_SANITIZATION_METHOD_CAPABILITIES",
+            (),
+        ):
+            with self.assertRaises(
+                auth.TrustedExecutionBindingError
+            ):
+                auth.build_trusted_execution_binding(
+                    registry=registry,
+                    approval_id=evidence.approval_id,
+                    request=request,
+                    record=record,
+                )
+
+    def test_phase6da_binding_integrity_and_surface_are_non_executing(
+        self,
+    ):
+        (
+            registry,
+            record,
+            request,
+            _challenge,
+            evidence,
+            _revalidation,
+            _snapshot,
+            _at,
+        ) = self._phase6da_success(
+            request_id="PHASE6DA-SURFACE"
+        )
+
+        binding = auth.build_trusted_execution_binding(
+            registry=registry,
+            approval_id=evidence.approval_id,
+            request=request,
+            record=record,
+        )
+
+        field_names = {
+            field.name
+            for field in fields(
+                auth.TrustedExecutionBindingDecision
+            )
+        }
+
+        for forbidden in (
+            "approved",
+            "authorized",
+            "command",
+            "executable",
+            "executor",
+            "callback",
+            "device_handle",
+            "argv",
+            "arguments",
+            "shell",
+            "success",
+            "wipe",
+        ):
+            self.assertNotIn(
+                forbidden,
+                field_names,
+            )
+
+        self.assertEqual(
+            binding.status,
+            "execution_binding_satisfied",
+        )
+
+        self.assertNotIn(
+            "authorized",
+            binding.status,
+        )
+
+        tampered = replace(
+            binding,
+            operation="other",
+        )
+
+        self.assertFalse(
+            auth._trusted_execution_binding_integrity_valid(
+                tampered
+            )
+        )
+
+        source = inspect.getsource(
+            auth.build_trusted_execution_binding
+        )
+
+        for forbidden in (
+            "collect_current_drive_discovery",
+            "record_human_approval(",
+            "revalidate_approval(",
+            "subprocess",
+            "os.system",
+            "Popen",
+            "shell=True",
+            "exec(",
+            "eval(",
+            "open(",
+            "write_text",
+            "write_bytes",
+            "unlink",
+            "remove(",
+        ):
+            self.assertNotIn(
+                forbidden,
+                source,
+            )
+
 if __name__ == "__main__":
     unittest.main()

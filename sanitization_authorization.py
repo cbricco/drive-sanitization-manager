@@ -3574,6 +3574,17 @@ class ApprovalRegistry:
         self._approved_challenges: set[str] = set()
         self._consumed_approvals: set[str] = set()
 
+        # Phase 6D-A: retain only registry-produced successful
+        # revalidation evidence.  This is process-local state,
+        # not persistence and not execution authority.
+        self._successful_revalidations: dict[
+            str,
+            tuple[
+                ApprovalRevalidationDecision,
+                AuthorizationDecision,
+            ],
+        ] = {}
+
     def create_challenge(
         self,
         request: AuthorizationRequest,
@@ -4290,7 +4301,7 @@ class ApprovalRegistry:
                 evaluated_at=fresh_evaluated_at,
             )
 
-        return _approval_revalidation_result(
+        result = _approval_revalidation_result(
             approval_id=approval_id,
             evidence=evidence,
             fresh_decision=fresh,
@@ -4299,6 +4310,680 @@ class ApprovalRegistry:
             evaluated_at=fresh_evaluated_at,
         )
 
+        with self._state_lock:
+            if approval_id in self._successful_revalidations:
+                raise ApprovalError(
+                    "successful revalidation was already retained"
+                )
+
+            self._successful_revalidations[
+                approval_id
+            ] = (
+                result,
+                fresh,
+            )
+
+        return result
+
+
+EXECUTION_BINDING_POLICY_VERSION = (
+    "phase6d-a-execution-binding-v1"
+)
+EXECUTION_BINDING_SCHEMA_VERSION = 1
+EXECUTION_BINDING_STATUS_SATISFIED = (
+    "execution_binding_satisfied"
+)
+
+
+class TrustedExecutionBindingError(
+    AuthorizationError
+):
+    """Trusted execution-binding inputs failed closed."""
+
+
+@dataclass(frozen=True)
+class TrustedExecutionBindingDecision:
+    """Deterministic process-local execution-binding foundation.
+
+    A satisfied binding means exact registry-produced approval/revalidation
+    provenance, request identity, record snapshot, target binding, method
+    policy, and method constraints all agree.
+
+    It is not execution authorization, does not prove currentness at a later
+    time, and contains no command, executor, callback, or mutation authority.
+    """
+
+    binding_id: str
+    policy_version: str
+    schema_version: int
+    status: str
+    approval_id: str
+    challenge_id: str
+    approval_evidence_hash: str
+    revalidation_id: str
+    request_id: str
+    request_hash: str
+    record_snapshot_hash: str
+    original_prerequisite_decision_id: str
+    fresh_prerequisite_decision_id: str
+    method_profile_id: str
+    operation: str
+    target_binding_hash: str
+    constraint_evaluation_hash: str
+    revalidated_at_utc: str
+    prerequisite_valid_until_utc: str
+
+
+def _trusted_execution_binding_payload(
+    *,
+    policy_version: str,
+    schema_version: int,
+    status: str,
+    approval_id: str,
+    challenge_id: str,
+    approval_evidence_hash: str,
+    revalidation_id: str,
+    request_id: str,
+    request_hash: str,
+    record_snapshot_hash: str,
+    original_prerequisite_decision_id: str,
+    fresh_prerequisite_decision_id: str,
+    method_profile_id: str,
+    operation: str,
+    target_binding_hash: str,
+    constraint_evaluation_hash: str,
+    revalidated_at_utc: str,
+    prerequisite_valid_until_utc: str,
+) -> dict[str, Any]:
+    return {
+        "policy_version": policy_version,
+        "schema_version": schema_version,
+        "status": status,
+        "approval_id": approval_id,
+        "challenge_id": challenge_id,
+        "approval_evidence_hash": approval_evidence_hash,
+        "revalidation_id": revalidation_id,
+        "request_id": request_id,
+        "request_hash": request_hash,
+        "record_snapshot_hash": record_snapshot_hash,
+        "original_prerequisite_decision_id":
+            original_prerequisite_decision_id,
+        "fresh_prerequisite_decision_id":
+            fresh_prerequisite_decision_id,
+        "method_profile_id": method_profile_id,
+        "operation": operation,
+        "target_binding_hash": target_binding_hash,
+        "constraint_evaluation_hash":
+            constraint_evaluation_hash,
+        "revalidated_at_utc": revalidated_at_utc,
+        "prerequisite_valid_until_utc":
+            prerequisite_valid_until_utc,
+    }
+
+
+def _trusted_execution_binding_integrity_valid(
+    binding: Any,
+) -> bool:
+    """Check binding-object internal consistency only.
+
+    This helper does not prove registry provenance by itself.
+    """
+
+    try:
+        if not isinstance(
+            binding,
+            TrustedExecutionBindingDecision,
+        ):
+            return False
+
+        if (
+            binding.policy_version
+            != EXECUTION_BINDING_POLICY_VERSION
+            or type(binding.schema_version) is not int
+            or binding.schema_version
+            != EXECUTION_BINDING_SCHEMA_VERSION
+            or binding.status
+            != EXECUTION_BINDING_STATUS_SATISFIED
+        ):
+            return False
+
+        for value in (
+            binding.approval_id,
+            binding.challenge_id,
+            binding.request_id,
+        ):
+            if not _approval_text(value):
+                return False
+
+        for value in (
+            binding.method_profile_id,
+            binding.operation,
+        ):
+            if not _synthetic_plan_exact_text(value):
+                return False
+
+        for hash_value in (
+            binding.approval_evidence_hash,
+            binding.revalidation_id,
+            binding.request_hash,
+            binding.record_snapshot_hash,
+            binding.original_prerequisite_decision_id,
+            binding.fresh_prerequisite_decision_id,
+            binding.target_binding_hash,
+            binding.constraint_evaluation_hash,
+        ):
+            if not _synthetic_plan_hash_value(
+                hash_value
+            ):
+                return False
+
+        if (
+            not isinstance(binding.binding_id, str)
+            or not binding.binding_id.startswith("xeb_")
+            or len(binding.binding_id)
+            != len("xeb_") + 64
+            or not all(
+                character in "0123456789abcdef"
+                for character
+                in binding.binding_id[len("xeb_"):]
+            )
+        ):
+            return False
+
+        revalidated_at = _parse_utc(
+            binding.revalidated_at_utc,
+            "binding.revalidated_at_utc",
+        )
+
+        valid_until = _parse_utc(
+            binding.prerequisite_valid_until_utc,
+            "binding.prerequisite_valid_until_utc",
+        )
+
+        if (
+            _iso_utc(revalidated_at)
+            != binding.revalidated_at_utc
+            or _iso_utc(valid_until)
+            != binding.prerequisite_valid_until_utc
+            or revalidated_at > valid_until
+        ):
+            return False
+
+        payload = _trusted_execution_binding_payload(
+            policy_version=binding.policy_version,
+            schema_version=binding.schema_version,
+            status=binding.status,
+            approval_id=binding.approval_id,
+            challenge_id=binding.challenge_id,
+            approval_evidence_hash=(
+                binding.approval_evidence_hash
+            ),
+            revalidation_id=binding.revalidation_id,
+            request_id=binding.request_id,
+            request_hash=binding.request_hash,
+            record_snapshot_hash=(
+                binding.record_snapshot_hash
+            ),
+            original_prerequisite_decision_id=(
+                binding.original_prerequisite_decision_id
+            ),
+            fresh_prerequisite_decision_id=(
+                binding.fresh_prerequisite_decision_id
+            ),
+            method_profile_id=binding.method_profile_id,
+            operation=binding.operation,
+            target_binding_hash=(
+                binding.target_binding_hash
+            ),
+            constraint_evaluation_hash=(
+                binding.constraint_evaluation_hash
+            ),
+            revalidated_at_utc=(
+                binding.revalidated_at_utc
+            ),
+            prerequisite_valid_until_utc=(
+                binding.prerequisite_valid_until_utc
+            ),
+        )
+
+        expected_hash = _canonical_hash(payload)
+
+        return (
+            binding.binding_id
+            == (
+                "xeb_"
+                + expected_hash.split(":", 1)[1]
+            )
+        )
+
+    except Exception:
+        return False
+
+
+def build_trusted_execution_binding(
+    *,
+    registry: Any,
+    approval_id: Any,
+    request: Any,
+    record: Any,
+) -> TrustedExecutionBindingDecision:
+    """Build a non-executing binding from registry-held success evidence.
+
+    Caller-created approval evidence, revalidation decisions, fresh
+    prerequisite decisions, and constraint decisions are not accepted.
+    The function performs no discovery, approval event, external I/O,
+    command construction, or mutation.
+    """
+
+    if not isinstance(
+        registry,
+        ApprovalRegistry,
+    ):
+        raise TrustedExecutionBindingError(
+            "registry is invalid"
+        )
+
+    if not _approval_text(approval_id):
+        raise TrustedExecutionBindingError(
+            "approval_id is invalid"
+        )
+
+    if not isinstance(
+        request,
+        AuthorizationRequest,
+    ):
+        raise TrustedExecutionBindingError(
+            "request is invalid"
+        )
+
+    if not isinstance(record, DriveRecord):
+        raise TrustedExecutionBindingError(
+            "record is invalid"
+        )
+
+    try:
+        record.validate()
+        current_record_hash = (
+            record_snapshot_hash(record)
+        )
+        current_request_hash = (
+            request_hash(request)
+        )
+    except Exception as exc:
+        raise TrustedExecutionBindingError(
+            "request or record validation failed"
+        ) from exc
+
+    with registry._state_lock:
+        evidence = registry._approvals.get(
+            approval_id
+        )
+
+        retained = (
+            registry._successful_revalidations.get(
+                approval_id
+            )
+        )
+
+        if isinstance(
+            evidence,
+            HumanApprovalEvidence,
+        ):
+            challenge = registry._challenges.get(
+                evidence.challenge_id
+            )
+        else:
+            challenge = None
+
+        challenge_approved = (
+            isinstance(
+                evidence,
+                HumanApprovalEvidence,
+            )
+            and evidence.challenge_id
+            in registry._approved_challenges
+        )
+
+        approval_consumed = (
+            approval_id
+            in registry._consumed_approvals
+        )
+
+    if (
+        evidence is None
+        or challenge is None
+        or retained is None
+        or not challenge_approved
+        or not approval_consumed
+    ):
+        raise TrustedExecutionBindingError(
+            "successful registry provenance is unavailable"
+        )
+
+    if (
+        not isinstance(retained, tuple)
+        or len(retained) != 2
+    ):
+        raise TrustedExecutionBindingError(
+            "retained success evidence is malformed"
+        )
+
+    revalidation, fresh = retained
+
+    if not _approval_evidence_integrity_valid(
+        evidence
+    ):
+        raise TrustedExecutionBindingError(
+            "approval evidence integrity is invalid"
+        )
+
+    if not _approval_challenge_integrity_valid(
+        challenge
+    ):
+        raise TrustedExecutionBindingError(
+            "approval challenge integrity is invalid"
+        )
+
+    if (
+        challenge.challenge_id
+        != evidence.challenge_id
+        or challenge.request_id
+        != evidence.request_id
+        or challenge.request_hash
+        != evidence.request_hash
+        or challenge.record_snapshot_hash
+        != evidence.record_snapshot_hash
+        or challenge.prerequisite_decision_id
+        != evidence.prerequisite_decision_id
+        or challenge.target_binding_hash
+        != evidence.target_binding_hash
+    ):
+        raise TrustedExecutionBindingError(
+            "approval challenge/evidence binding is invalid"
+        )
+
+    if not isinstance(
+        revalidation,
+        ApprovalRevalidationDecision,
+    ):
+        raise TrustedExecutionBindingError(
+            "retained revalidation is invalid"
+        )
+
+    if not isinstance(
+        fresh,
+        AuthorizationDecision,
+    ):
+        raise TrustedExecutionBindingError(
+            "retained fresh prerequisite decision is invalid"
+        )
+
+    if (
+        revalidation.status
+        != APPROVAL_STATUS_REVALIDATED
+        or revalidation.reason_codes != ()
+    ):
+        raise TrustedExecutionBindingError(
+            "retained revalidation was not successful"
+        )
+
+    try:
+        revalidated_at = _parse_utc(
+            revalidation.evaluated_at_utc,
+            "revalidation.evaluated_at_utc",
+        )
+    except AuthorizationError as exc:
+        raise TrustedExecutionBindingError(
+            "retained revalidation timestamp is invalid"
+        ) from exc
+
+    expected_revalidation = (
+        _approval_revalidation_result(
+            approval_id=approval_id,
+            evidence=evidence,
+            fresh_decision=fresh,
+            status=APPROVAL_STATUS_REVALIDATED,
+            reason_codes=(),
+            evaluated_at=revalidated_at,
+        )
+    )
+
+    if revalidation != expected_revalidation:
+        raise TrustedExecutionBindingError(
+            "retained revalidation integrity is invalid"
+        )
+
+    if (
+        revalidation.approval_id
+        != evidence.approval_id
+        or revalidation.challenge_id
+        != evidence.challenge_id
+        or revalidation.request_id
+        != evidence.request_id
+        or revalidation.original_prerequisite_decision_id
+        != evidence.prerequisite_decision_id
+        or revalidation.original_target_binding_hash
+        != evidence.target_binding_hash
+    ):
+        raise TrustedExecutionBindingError(
+            "retained revalidation provenance mismatch"
+        )
+
+    if not decision_integrity_valid(fresh):
+        raise TrustedExecutionBindingError(
+            "fresh prerequisite decision integrity is invalid"
+        )
+
+    if (
+        fresh.status != STATUS_PREREQUISITES_MET
+        or fresh.reason_codes != ()
+        or fresh.request_hash is None
+        or fresh.record_snapshot_hash is None
+        or fresh.target_binding_hash is None
+        or fresh.target_binding is None
+        or fresh.prerequisite_valid_until_utc is None
+    ):
+        raise TrustedExecutionBindingError(
+            "fresh prerequisite decision is not positive and complete"
+        )
+
+    if (
+        revalidation.fresh_prerequisite_decision_id
+        != fresh.decision_id
+        or revalidation.fresh_target_binding_hash
+        != fresh.target_binding_hash
+    ):
+        raise TrustedExecutionBindingError(
+            "fresh prerequisite/revalidation binding mismatch"
+        )
+
+    if (
+        request.schema_version != SCHEMA_VERSION
+        or request.request_id != evidence.request_id
+        or current_request_hash
+        != evidence.request_hash
+        or fresh.request_id != request.request_id
+        or fresh.request_hash
+        != current_request_hash
+    ):
+        raise TrustedExecutionBindingError(
+            "authorization request binding mismatch"
+        )
+
+    if (
+        request.batch_job_id
+        != record.batch_job_id
+        or request.internal_record_id
+        != record.internal_record_id
+        or request.record_snapshot_hash
+        != current_record_hash
+        or evidence.record_snapshot_hash
+        != current_record_hash
+        or fresh.record_snapshot_hash
+        != current_record_hash
+    ):
+        raise TrustedExecutionBindingError(
+            "drive record snapshot binding mismatch"
+        )
+
+    policy = get_sanitization_method_policy(
+        request.method_profile_id
+    )
+
+    metadata = (
+        get_sanitization_method_capability_metadata(
+            request.method_profile_id
+        )
+    )
+
+    if policy is None or metadata is None:
+        raise TrustedExecutionBindingError(
+            "trusted method metadata is unavailable"
+        )
+
+    if (
+        policy.method_profile_id
+        != request.method_profile_id
+        or metadata.method_profile_id
+        != request.method_profile_id
+        or policy.operation != request.operation
+        or policy.policy_only is not True
+        or policy.execution_supported is not False
+        or metadata.capability_class != "policy_only"
+    ):
+        raise TrustedExecutionBindingError(
+            "trusted method binding mismatch"
+        )
+
+    target_binding_hash = _canonical_hash(
+        asdict(fresh.target_binding)
+    )
+
+    if (
+        target_binding_hash
+        != fresh.target_binding_hash
+        or target_binding_hash
+        != evidence.target_binding_hash
+        or target_binding_hash
+        != revalidation.original_target_binding_hash
+        or target_binding_hash
+        != revalidation.fresh_target_binding_hash
+    ):
+        raise TrustedExecutionBindingError(
+            "target binding provenance mismatch"
+        )
+
+    constraints = (
+        evaluate_sanitization_method_constraints(
+            request.method_profile_id,
+            fresh.target_binding,
+        )
+    )
+
+    if (
+        constraints.method_profile_id
+        != request.method_profile_id
+        or constraints.status
+        != METHOD_CONSTRAINT_STATUS_SATISFIED
+        or constraints.reason_codes != ()
+        or constraints.target_binding_hash
+        != target_binding_hash
+    ):
+        raise TrustedExecutionBindingError(
+            "method constraints are not satisfied"
+        )
+
+    constraint_hash = _canonical_hash(
+        asdict(constraints)
+    )
+
+    try:
+        prerequisite_valid_until = _parse_utc(
+            fresh.prerequisite_valid_until_utc,
+            "fresh.prerequisite_valid_until_utc",
+        )
+    except AuthorizationError as exc:
+        raise TrustedExecutionBindingError(
+            "fresh prerequisite expiry is invalid"
+        ) from exc
+
+    if revalidated_at > prerequisite_valid_until:
+        raise TrustedExecutionBindingError(
+            "revalidation occurred after prerequisite expiry"
+        )
+
+    payload = _trusted_execution_binding_payload(
+        policy_version=EXECUTION_BINDING_POLICY_VERSION,
+        schema_version=EXECUTION_BINDING_SCHEMA_VERSION,
+        status=EXECUTION_BINDING_STATUS_SATISFIED,
+        approval_id=approval_id,
+        challenge_id=evidence.challenge_id,
+        approval_evidence_hash=evidence.evidence_hash,
+        revalidation_id=revalidation.revalidation_id,
+        request_id=request.request_id,
+        request_hash=current_request_hash,
+        record_snapshot_hash=current_record_hash,
+        original_prerequisite_decision_id=(
+            evidence.prerequisite_decision_id
+        ),
+        fresh_prerequisite_decision_id=(
+            fresh.decision_id
+        ),
+        method_profile_id=request.method_profile_id,
+        operation=request.operation,
+        target_binding_hash=target_binding_hash,
+        constraint_evaluation_hash=constraint_hash,
+        revalidated_at_utc=(
+            revalidation.evaluated_at_utc
+        ),
+        prerequisite_valid_until_utc=(
+            fresh.prerequisite_valid_until_utc
+        ),
+    )
+
+    payload_hash = _canonical_hash(payload)
+
+    binding = TrustedExecutionBindingDecision(
+        binding_id=(
+            "xeb_"
+            + payload_hash.split(":", 1)[1]
+        ),
+        policy_version=EXECUTION_BINDING_POLICY_VERSION,
+        schema_version=EXECUTION_BINDING_SCHEMA_VERSION,
+        status=EXECUTION_BINDING_STATUS_SATISFIED,
+        approval_id=approval_id,
+        challenge_id=evidence.challenge_id,
+        approval_evidence_hash=evidence.evidence_hash,
+        revalidation_id=revalidation.revalidation_id,
+        request_id=request.request_id,
+        request_hash=current_request_hash,
+        record_snapshot_hash=current_record_hash,
+        original_prerequisite_decision_id=(
+            evidence.prerequisite_decision_id
+        ),
+        fresh_prerequisite_decision_id=(
+            fresh.decision_id
+        ),
+        method_profile_id=request.method_profile_id,
+        operation=request.operation,
+        target_binding_hash=target_binding_hash,
+        constraint_evaluation_hash=constraint_hash,
+        revalidated_at_utc=(
+            revalidation.evaluated_at_utc
+        ),
+        prerequisite_valid_until_utc=(
+            fresh.prerequisite_valid_until_utc
+        ),
+    )
+
+    if not _trusted_execution_binding_integrity_valid(
+        binding
+    ):
+        raise TrustedExecutionBindingError(
+            "constructed execution binding failed integrity validation"
+        )
+
+    return binding
 __all__ = [
     "APPROVAL_POLICY_VERSION",
     "APPROVAL_CHALLENGE_LIFETIME_SECONDS",
@@ -4310,6 +4995,11 @@ __all__ = [
     "HumanApprovalEvidence",
     "ApprovalRevalidationDecision",
     "ApprovalRegistry",
+    "TrustedExecutionBindingDecision",
+    "TrustedExecutionBindingError",
+    "EXECUTION_BINDING_POLICY_VERSION",
+    "EXECUTION_BINDING_SCHEMA_VERSION",
+    "EXECUTION_BINDING_STATUS_SATISFIED",
     "AuthorizationDecision",
     "AuthorizationError",
     "AuthorizationRequest",
@@ -4356,6 +5046,7 @@ __all__ = [
     "build_synthetic_sanitization_plan",
     "run_synthetic_sanitization_plan",
     "build_drive_record_with_synthetic_run_evidence",
+    "build_trusted_execution_binding",
     "record_snapshot_hash",
     "request_hash",
 ]
