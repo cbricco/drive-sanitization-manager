@@ -1151,6 +1151,452 @@ def build_synthetic_sanitization_plan(
 
     return plan
 
+SYNTHETIC_SANITIZATION_RUN_SCHEMA_VERSION = 1
+SYNTHETIC_SANITIZATION_RUN_MODE = "synthetic_memory_only"
+SYNTHETIC_SANITIZATION_RUN_STATUS_COMPLETED = "synthetic_completed"
+SYNTHETIC_SANITIZATION_MAX_PAYLOAD_BYTES = 1_048_576
+
+
+class SyntheticSanitizationRunError(AuthorizationError):
+    """Synthetic in-memory run could not be performed safely."""
+
+
+@dataclass(frozen=True)
+class SyntheticSanitizationMemoryTarget:
+    """Immutable synthetic target backed only by in-memory bytes."""
+
+    synthetic_target_id: str
+    target_binding_hash: str
+    payload: bytes
+
+
+@dataclass(frozen=True)
+class SyntheticSanitizationRunResult:
+    """Frozen deterministic evidence from one synthetic-only memory run.
+
+    Integrity here proves internal consistency only.  This result is not
+    evidence that any physical storage device was sanitized.
+    """
+
+    run_id: str
+    schema_version: int
+    run_mode: str
+    status: str
+    plan_id: str
+    plan_hash: str
+    method_profile_id: str
+    operation: str
+    synthetic_target_id: str
+    target_binding_hash: str
+    constraint_evaluation_hash: str
+    input_payload_hash: str
+    output_payload_hash: str
+    bytes_processed: int
+    result_hash: str
+
+
+def _synthetic_memory_payload_hash(
+    payload: bytes,
+) -> str:
+    return (
+        "sha256:"
+        + hashlib.sha256(payload).hexdigest()
+    )
+
+
+def _synthetic_run_id_value(
+    value: Any,
+) -> bool:
+    if (
+        not isinstance(value, str)
+        or not value.startswith("srun_")
+        or len(value) != len("srun_") + 64
+    ):
+        return False
+
+    suffix = value[len("srun_"):]
+
+    return all(
+        character in "0123456789abcdef"
+        for character in suffix
+    )
+
+
+def _synthetic_memory_target_valid(
+    target: Any,
+) -> bool:
+    if not isinstance(
+        target,
+        SyntheticSanitizationMemoryTarget,
+    ):
+        return False
+
+    if not _synthetic_target_id_valid(
+        target.synthetic_target_id
+    ):
+        return False
+
+    if not _synthetic_plan_hash_value(
+        target.target_binding_hash
+    ):
+        return False
+
+    if type(target.payload) is not bytes:
+        return False
+
+    return (
+        0 < len(target.payload)
+        <= SYNTHETIC_SANITIZATION_MAX_PAYLOAD_BYTES
+    )
+
+
+def _synthetic_sanitization_run_payload(
+    *,
+    schema_version: int,
+    run_mode: str,
+    status: str,
+    plan_id: str,
+    plan_hash: str,
+    method_profile_id: str,
+    operation: str,
+    synthetic_target_id: str,
+    target_binding_hash: str,
+    constraint_evaluation_hash: str,
+    input_payload_hash: str,
+    output_payload_hash: str,
+    bytes_processed: int,
+) -> dict[str, Any]:
+    return {
+        "schema_version": schema_version,
+        "run_mode": run_mode,
+        "status": status,
+        "plan_id": plan_id,
+        "plan_hash": plan_hash,
+        "method_profile_id": method_profile_id,
+        "operation": operation,
+        "synthetic_target_id": synthetic_target_id,
+        "target_binding_hash": target_binding_hash,
+        "constraint_evaluation_hash": (
+            constraint_evaluation_hash
+        ),
+        "input_payload_hash": input_payload_hash,
+        "output_payload_hash": output_payload_hash,
+        "bytes_processed": bytes_processed,
+    }
+
+
+def _synthetic_sanitization_run_result_integrity_valid(
+    result: Any,
+) -> bool:
+    try:
+        if not isinstance(
+            result,
+            SyntheticSanitizationRunResult,
+        ):
+            return False
+
+        if (
+            type(result.schema_version) is not int
+            or result.schema_version
+            != SYNTHETIC_SANITIZATION_RUN_SCHEMA_VERSION
+            or result.run_mode
+            != SYNTHETIC_SANITIZATION_RUN_MODE
+            or result.status
+            != SYNTHETIC_SANITIZATION_RUN_STATUS_COMPLETED
+        ):
+            return False
+
+        if not _synthetic_run_id_value(
+            result.run_id
+        ):
+            return False
+
+        if (
+            not isinstance(result.plan_id, str)
+            or not result.plan_id.startswith("splan_")
+            or len(result.plan_id)
+            != len("splan_") + 64
+            or not all(
+                character in "0123456789abcdef"
+                for character
+                in result.plan_id[len("splan_"):]
+            )
+        ):
+            return False
+
+        if not _synthetic_plan_hash_value(
+            result.plan_hash
+        ):
+            return False
+
+        if not _synthetic_plan_exact_text(
+            result.method_profile_id
+        ):
+            return False
+
+        if not _synthetic_plan_exact_text(
+            result.operation
+        ):
+            return False
+
+        if not _synthetic_target_id_valid(
+            result.synthetic_target_id
+        ):
+            return False
+
+        for hash_value in (
+            result.target_binding_hash,
+            result.constraint_evaluation_hash,
+            result.input_payload_hash,
+            result.output_payload_hash,
+            result.result_hash,
+        ):
+            if not _synthetic_plan_hash_value(
+                hash_value
+            ):
+                return False
+
+        if (
+            type(result.bytes_processed) is not int
+            or result.bytes_processed <= 0
+            or result.bytes_processed
+            > SYNTHETIC_SANITIZATION_MAX_PAYLOAD_BYTES
+        ):
+            return False
+
+        expected_output_hash = (
+            _synthetic_memory_payload_hash(
+                bytes(result.bytes_processed)
+            )
+        )
+
+        if (
+            result.output_payload_hash
+            != expected_output_hash
+        ):
+            return False
+
+        payload = (
+            _synthetic_sanitization_run_payload(
+                schema_version=result.schema_version,
+                run_mode=result.run_mode,
+                status=result.status,
+                plan_id=result.plan_id,
+                plan_hash=result.plan_hash,
+                method_profile_id=(
+                    result.method_profile_id
+                ),
+                operation=result.operation,
+                synthetic_target_id=(
+                    result.synthetic_target_id
+                ),
+                target_binding_hash=(
+                    result.target_binding_hash
+                ),
+                constraint_evaluation_hash=(
+                    result.constraint_evaluation_hash
+                ),
+                input_payload_hash=(
+                    result.input_payload_hash
+                ),
+                output_payload_hash=(
+                    result.output_payload_hash
+                ),
+                bytes_processed=(
+                    result.bytes_processed
+                ),
+            )
+        )
+
+        expected_result_hash = _canonical_hash(
+            payload
+        )
+
+        expected_run_id = (
+            "srun_"
+            + expected_result_hash.split(":", 1)[1]
+        )
+
+        return (
+            result.result_hash
+            == expected_result_hash
+            and result.run_id == expected_run_id
+        )
+    except Exception:
+        return False
+
+
+def run_synthetic_sanitization_plan(
+    *,
+    plan: Any,
+    target: Any,
+) -> SyntheticSanitizationRunResult:
+    """Run one bounded sanitization simulation entirely in memory.
+
+    The input bytes are immutable.  A zero-filled bytes object is created
+    only in memory to model the synthetic result.  Nothing is written to
+    external state.
+    """
+
+    if not isinstance(
+        plan,
+        SyntheticSanitizationPlan,
+    ):
+        raise SyntheticSanitizationRunError(
+            "plan is invalid"
+        )
+
+    if not _synthetic_sanitization_plan_integrity_valid(
+        plan
+    ):
+        raise SyntheticSanitizationRunError(
+            "plan integrity is invalid"
+        )
+
+    policy = get_sanitization_method_policy(
+        plan.method_profile_id
+    )
+
+    metadata = (
+        get_sanitization_method_capability_metadata(
+            plan.method_profile_id
+        )
+    )
+
+    if policy is None or metadata is None:
+        raise SyntheticSanitizationRunError(
+            "trusted method metadata is unavailable"
+        )
+
+    if (
+        policy.method_profile_id
+        != plan.method_profile_id
+        or metadata.method_profile_id
+        != plan.method_profile_id
+        or policy.operation != plan.operation
+        or policy.policy_only is not True
+        or policy.execution_supported is not False
+        or metadata.capability_class != "policy_only"
+    ):
+        raise SyntheticSanitizationRunError(
+            "plan is outside synthetic-only policy"
+        )
+
+    if not _synthetic_memory_target_valid(
+        target
+    ):
+        raise SyntheticSanitizationRunError(
+            "synthetic memory target is invalid"
+        )
+
+    if (
+        target.synthetic_target_id
+        != plan.synthetic_target_id
+        or target.target_binding_hash
+        != plan.target_binding_hash
+    ):
+        raise SyntheticSanitizationRunError(
+            "synthetic target does not match plan"
+        )
+
+    input_payload_hash = (
+        _synthetic_memory_payload_hash(
+            target.payload
+        )
+    )
+
+    output_payload = bytes(
+        len(target.payload)
+    )
+
+    output_payload_hash = (
+        _synthetic_memory_payload_hash(
+            output_payload
+        )
+    )
+
+    payload = (
+        _synthetic_sanitization_run_payload(
+            schema_version=(
+                SYNTHETIC_SANITIZATION_RUN_SCHEMA_VERSION
+            ),
+            run_mode=(
+                SYNTHETIC_SANITIZATION_RUN_MODE
+            ),
+            status=(
+                SYNTHETIC_SANITIZATION_RUN_STATUS_COMPLETED
+            ),
+            plan_id=plan.plan_id,
+            plan_hash=plan.plan_hash,
+            method_profile_id=(
+                plan.method_profile_id
+            ),
+            operation=plan.operation,
+            synthetic_target_id=(
+                plan.synthetic_target_id
+            ),
+            target_binding_hash=(
+                plan.target_binding_hash
+            ),
+            constraint_evaluation_hash=(
+                plan.constraint_evaluation_hash
+            ),
+            input_payload_hash=input_payload_hash,
+            output_payload_hash=output_payload_hash,
+            bytes_processed=len(target.payload),
+        )
+    )
+
+    result_hash = _canonical_hash(
+        payload
+    )
+
+    result = SyntheticSanitizationRunResult(
+        run_id=(
+            "srun_"
+            + result_hash.split(":", 1)[1]
+        ),
+        schema_version=(
+            SYNTHETIC_SANITIZATION_RUN_SCHEMA_VERSION
+        ),
+        run_mode=(
+            SYNTHETIC_SANITIZATION_RUN_MODE
+        ),
+        status=(
+            SYNTHETIC_SANITIZATION_RUN_STATUS_COMPLETED
+        ),
+        plan_id=plan.plan_id,
+        plan_hash=plan.plan_hash,
+        method_profile_id=(
+            plan.method_profile_id
+        ),
+        operation=plan.operation,
+        synthetic_target_id=(
+            plan.synthetic_target_id
+        ),
+        target_binding_hash=(
+            plan.target_binding_hash
+        ),
+        constraint_evaluation_hash=(
+            plan.constraint_evaluation_hash
+        ),
+        input_payload_hash=input_payload_hash,
+        output_payload_hash=output_payload_hash,
+        bytes_processed=len(target.payload),
+        result_hash=result_hash,
+    )
+
+    if not (
+        _synthetic_sanitization_run_result_integrity_valid(
+            result
+        )
+    ):
+        raise SyntheticSanitizationRunError(
+            "synthetic run result failed integrity validation"
+        )
+
+    return result
+
 
 def _contains_forbidden_control(value: str) -> bool:
     return any(
@@ -3628,6 +4074,13 @@ __all__ = [
     "SyntheticSanitizationPlanError",
     "SYNTHETIC_SANITIZATION_PLAN_SCHEMA_VERSION",
     "SYNTHETIC_SANITIZATION_PLAN_MODE",
+    "SyntheticSanitizationMemoryTarget",
+    "SyntheticSanitizationRunResult",
+    "SyntheticSanitizationRunError",
+    "SYNTHETIC_SANITIZATION_RUN_SCHEMA_VERSION",
+    "SYNTHETIC_SANITIZATION_RUN_MODE",
+    "SYNTHETIC_SANITIZATION_RUN_STATUS_COMPLETED",
+    "SYNTHETIC_SANITIZATION_MAX_PAYLOAD_BYTES",
     "METHOD_CONSTRAINT_STATUS_SATISFIED",
     "METHOD_CONSTRAINT_STATUS_REVIEW_REQUIRED",
     "METHOD_CONSTRAINT_STATUS_REFUSED",
@@ -3652,6 +4105,7 @@ __all__ = [
     "get_sanitization_method_capability_metadata",
     "evaluate_sanitization_method_constraints",
     "build_synthetic_sanitization_plan",
+    "run_synthetic_sanitization_plan",
     "record_snapshot_hash",
     "request_hash",
 ]

@@ -6062,5 +6062,499 @@ class Phase5AuthorizationR2Tests(unittest.TestCase):
                 source,
             )
 
+    def _phase6cb_fixture(
+        self,
+        payload=b"synthetic secret",
+    ):
+        binding = auth.TargetIdentityBinding(
+            path="synthetic://drive-a",
+            serial="SERIAL-A",
+            wwn="WWN-A",
+            size_bytes=1_000_000,
+            model="Synthetic Model",
+            transport="synthetic",
+            read_only=False,
+            mounted=False,
+            protected=False,
+            system_protected=False,
+            review_required=False,
+            ambiguous=False,
+        )
+
+        constraints = (
+            auth.evaluate_sanitization_method_constraints(
+                "phase5-policy-only",
+                binding,
+            )
+        )
+
+        plan = auth.build_synthetic_sanitization_plan(
+            method_profile_id="phase5-policy-only",
+            operation="sanitize",
+            synthetic_target_id="synthetic://drive-a",
+            target_binding=binding,
+            constraint_evaluation=constraints,
+        )
+
+        target = auth.SyntheticSanitizationMemoryTarget(
+            synthetic_target_id="synthetic://drive-a",
+            target_binding_hash=plan.target_binding_hash,
+            payload=payload,
+        )
+
+        return binding, constraints, plan, target
+
+    def test_phase6cb_runs_exact_frozen_deterministic_memory_simulation(
+        self,
+    ):
+        _, _, plan, target = self._phase6cb_fixture()
+
+        first = auth.run_synthetic_sanitization_plan(
+            plan=plan,
+            target=target,
+        )
+
+        second = auth.run_synthetic_sanitization_plan(
+            plan=plan,
+            target=target,
+        )
+
+        self.assertEqual(first, second)
+
+        self.assertEqual(
+            first.run_mode,
+            auth.SYNTHETIC_SANITIZATION_RUN_MODE,
+        )
+
+        self.assertEqual(
+            first.status,
+            auth.SYNTHETIC_SANITIZATION_RUN_STATUS_COMPLETED,
+        )
+
+        self.assertEqual(
+            first.plan_id,
+            plan.plan_id,
+        )
+
+        self.assertEqual(
+            first.plan_hash,
+            plan.plan_hash,
+        )
+
+        self.assertEqual(
+            first.synthetic_target_id,
+            target.synthetic_target_id,
+        )
+
+        self.assertEqual(
+            first.target_binding_hash,
+            target.target_binding_hash,
+        )
+
+        self.assertEqual(
+            first.bytes_processed,
+            len(target.payload),
+        )
+
+        self.assertTrue(
+            first.run_id.startswith("srun_")
+        )
+
+        self.assertTrue(
+            auth._synthetic_sanitization_run_result_integrity_valid(
+                first
+            )
+        )
+
+        with self.assertRaises(FrozenInstanceError):
+            first.status = "other"
+
+    def test_phase6cb_memory_target_is_frozen(
+        self,
+    ):
+        _, _, _, target = self._phase6cb_fixture()
+
+        self.assertIs(
+            type(target.payload),
+            bytes,
+        )
+
+        with self.assertRaises(FrozenInstanceError):
+            target.payload = b"changed"
+
+        with self.assertRaises(FrozenInstanceError):
+            target.synthetic_target_id = (
+                "synthetic://drive-b"
+            )
+
+    def test_phase6cb_rejects_target_identity_or_binding_mismatch(
+        self,
+    ):
+        _, _, plan, target = self._phase6cb_fixture()
+
+        wrong_id = replace(
+            target,
+            synthetic_target_id="synthetic://drive-b",
+        )
+
+        wrong_hash = replace(
+            target,
+            target_binding_hash=(
+                "sha256:" + ("0" * 64)
+            ),
+        )
+
+        for candidate in (
+            wrong_id,
+            wrong_hash,
+        ):
+            with self.subTest(candidate=candidate):
+                with self.assertRaises(
+                    auth.SyntheticSanitizationRunError
+                ):
+                    auth.run_synthetic_sanitization_plan(
+                        plan=plan,
+                        target=candidate,
+                    )
+
+        real_named = replace(
+            target,
+            synthetic_target_id="/dev/sda",
+        )
+
+        with self.assertRaises(
+            auth.SyntheticSanitizationRunError
+        ):
+            auth.run_synthetic_sanitization_plan(
+                plan=plan,
+                target=real_named,
+            )
+
+    def test_phase6cb_rejects_invalid_payload_types_and_sizes(
+        self,
+    ):
+        _, _, plan, target = self._phase6cb_fixture()
+
+        invalid_targets = (
+            replace(
+                target,
+                payload=b"",
+            ),
+            replace(
+                target,
+                payload=bytearray(b"abc"),
+            ),
+            replace(
+                target,
+                payload=memoryview(b"abc"),
+            ),
+            replace(
+                target,
+                payload="abc",
+            ),
+            replace(
+                target,
+                payload=(
+                    b"x"
+                    * (
+                        auth.SYNTHETIC_SANITIZATION_MAX_PAYLOAD_BYTES
+                        + 1
+                    )
+                ),
+            ),
+        )
+
+        for candidate in invalid_targets:
+            with self.subTest(
+                payload_type=type(candidate.payload).__name__,
+                payload_length=(
+                    len(candidate.payload)
+                    if hasattr(candidate.payload, "__len__")
+                    else None
+                ),
+            ):
+                with self.assertRaises(
+                    auth.SyntheticSanitizationRunError
+                ):
+                    auth.run_synthetic_sanitization_plan(
+                        plan=plan,
+                        target=candidate,
+                    )
+
+    def test_phase6cb_rejects_tampered_plan(
+        self,
+    ):
+        _, _, plan, target = self._phase6cb_fixture()
+
+        tampered = (
+            replace(
+                plan,
+                operation="other",
+            ),
+            replace(
+                plan,
+                synthetic_target_id="synthetic://drive-b",
+            ),
+            replace(
+                plan,
+                target_binding_hash=(
+                    "sha256:" + ("0" * 64)
+                ),
+            ),
+            replace(
+                plan,
+                plan_hash=(
+                    "sha256:" + ("1" * 64)
+                ),
+            ),
+            replace(
+                plan,
+                plan_id="splan_" + ("2" * 64),
+            ),
+        )
+
+        for candidate in tampered:
+            with self.subTest(candidate=candidate):
+                self.assertFalse(
+                    auth._synthetic_sanitization_plan_integrity_valid(
+                        candidate
+                    )
+                )
+
+                with self.assertRaises(
+                    auth.SyntheticSanitizationRunError
+                ):
+                    auth.run_synthetic_sanitization_plan(
+                        plan=candidate,
+                        target=target,
+                    )
+
+    def test_phase6cb_rejects_rehashed_plan_outside_trusted_policy(
+        self,
+    ):
+        _, _, plan, target = self._phase6cb_fixture()
+
+        payload = (
+            auth._synthetic_sanitization_plan_payload(
+                schema_version=plan.schema_version,
+                plan_mode=plan.plan_mode,
+                method_profile_id=plan.method_profile_id,
+                operation="other",
+                synthetic_target_id=plan.synthetic_target_id,
+                target_binding_hash=plan.target_binding_hash,
+                constraint_evaluation_hash=(
+                    plan.constraint_evaluation_hash
+                ),
+            )
+        )
+
+        forged_hash = auth._canonical_hash(
+            payload
+        )
+
+        forged = replace(
+            plan,
+            operation="other",
+            plan_hash=forged_hash,
+            plan_id=(
+                "splan_"
+                + forged_hash.split(":", 1)[1]
+            ),
+        )
+
+        self.assertTrue(
+            auth._synthetic_sanitization_plan_integrity_valid(
+                forged
+            )
+        )
+
+        with self.assertRaises(
+            auth.SyntheticSanitizationRunError
+        ):
+            auth.run_synthetic_sanitization_plan(
+                plan=forged,
+                target=target,
+            )
+
+    def test_phase6cb_preserves_input_payload_and_zero_models_output(
+        self,
+    ):
+        original = b"\x01\x02\x03secret"
+
+        _, _, plan, target = (
+            self._phase6cb_fixture(
+                payload=original
+            )
+        )
+
+        before = target.payload
+
+        result = auth.run_synthetic_sanitization_plan(
+            plan=plan,
+            target=target,
+        )
+
+        self.assertEqual(
+            target.payload,
+            before,
+        )
+
+        self.assertIs(
+            target.payload,
+            before,
+        )
+
+        self.assertEqual(
+            result.input_payload_hash,
+            auth._synthetic_memory_payload_hash(
+                original
+            ),
+        )
+
+        self.assertEqual(
+            result.output_payload_hash,
+            auth._synthetic_memory_payload_hash(
+                bytes(len(original))
+            ),
+        )
+
+        self.assertNotEqual(
+            result.input_payload_hash,
+            result.output_payload_hash,
+        )
+
+    def test_phase6cb_run_result_integrity_detects_tampering(
+        self,
+    ):
+        _, _, plan, target = self._phase6cb_fixture()
+
+        result = auth.run_synthetic_sanitization_plan(
+            plan=plan,
+            target=target,
+        )
+
+        self.assertTrue(
+            auth._synthetic_sanitization_run_result_integrity_valid(
+                result
+            )
+        )
+
+        tampered = (
+            replace(
+                result,
+                status="other",
+            ),
+            replace(
+                result,
+                plan_hash="sha256:" + ("0" * 64),
+            ),
+            replace(
+                result,
+                synthetic_target_id="synthetic://drive-b",
+            ),
+            replace(
+                result,
+                output_payload_hash=(
+                    "sha256:" + ("1" * 64)
+                ),
+            ),
+            replace(
+                result,
+                bytes_processed=(
+                    result.bytes_processed + 1
+                ),
+            ),
+            replace(
+                result,
+                result_hash="sha256:" + ("2" * 64),
+            ),
+            replace(
+                result,
+                run_id="srun_" + ("3" * 64),
+            ),
+        )
+
+        for candidate in tampered:
+            with self.subTest(candidate=candidate):
+                self.assertFalse(
+                    auth._synthetic_sanitization_run_result_integrity_valid(
+                        candidate
+                    )
+                )
+
+    def test_phase6cb_runner_surface_has_no_external_execution_authority(
+        self,
+    ):
+        target_fields = {
+            field.name
+            for field in fields(
+                auth.SyntheticSanitizationMemoryTarget
+            )
+        }
+
+        self.assertEqual(
+            target_fields,
+            {
+                "synthetic_target_id",
+                "target_binding_hash",
+                "payload",
+            },
+        )
+
+        result_fields = {
+            field.name
+            for field in fields(
+                auth.SyntheticSanitizationRunResult
+            )
+        }
+
+        self.assertEqual(
+            result_fields,
+            {
+                "run_id",
+                "schema_version",
+                "run_mode",
+                "status",
+                "plan_id",
+                "plan_hash",
+                "method_profile_id",
+                "operation",
+                "synthetic_target_id",
+                "target_binding_hash",
+                "constraint_evaluation_hash",
+                "input_payload_hash",
+                "output_payload_hash",
+                "bytes_processed",
+                "result_hash",
+            },
+        )
+
+        source = inspect.getsource(
+            auth.run_synthetic_sanitization_plan
+        )
+
+        for forbidden in (
+            "subprocess",
+            "os.system",
+            "Popen",
+            "shell=True",
+            "exec(",
+            "eval(",
+            "open(",
+            "collect_current_drive_discovery",
+            "ApprovalRegistry",
+            "record_human_approval",
+            "revalidate_approval",
+            "write_text",
+            "write_bytes",
+            "unlink",
+            "remove(",
+            "/dev/",
+        ):
+            self.assertNotIn(
+                forbidden,
+                source,
+            )
+
 if __name__ == "__main__":
     unittest.main()
