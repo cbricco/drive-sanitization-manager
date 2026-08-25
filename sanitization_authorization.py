@@ -12,8 +12,13 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
+import fcntl
 import hashlib
 import json
+import os
+from pathlib import Path
+import stat
+import tempfile
 from typing import Any, Optional
 
 from drive_discovery import (
@@ -5519,6 +5524,1059 @@ def satisfy_one_shot_execution_gate(
         )
 
         return gate
+
+DURABLE_GATE_JOURNAL_POLICY_VERSION = (
+    "phase6d-c-durable-consumption-v1"
+)
+DURABLE_GATE_JOURNAL_SCHEMA_VERSION = 1
+DURABLE_GATE_JOURNAL_MAX_BYTES = 1_048_576
+
+DURABLE_GATE_JOURNAL_STATE_RESERVED = "reserved"
+DURABLE_GATE_JOURNAL_STATE_COMPLETED = "completed"
+
+
+class DurableExecutionGateJournalError(
+    AuthorizationError
+):
+    """Durable execution-gate journal failed closed."""
+
+
+class DurableOneShotExecutionGateError(
+    AuthorizationError
+):
+    """Durable one-shot gate could not complete safely."""
+
+
+@dataclass(frozen=True)
+class DurableExecutionGateJournalEntry:
+    binding_id: str
+    state: str
+    request_hash: str
+    record_snapshot_hash: str
+    target_binding_hash: str
+    reserved_at_utc: str
+    gate_id: Optional[str]
+    completed_at_utc: Optional[str]
+    entry_hash: str
+
+
+def _durable_prefixed_hex_id(
+    value: Any,
+    prefix: str,
+) -> bool:
+    return (
+        isinstance(value, str)
+        and value.startswith(prefix)
+        and len(value) == len(prefix) + 64
+        and all(
+            character in "0123456789abcdef"
+            for character in value[len(prefix):]
+        )
+    )
+
+
+def _durable_gate_journal_entry_payload(
+    *,
+    binding_id: str,
+    state: str,
+    request_hash: str,
+    record_snapshot_hash: str,
+    target_binding_hash: str,
+    reserved_at_utc: str,
+    gate_id: Optional[str],
+    completed_at_utc: Optional[str],
+) -> dict[str, Any]:
+    return {
+        "binding_id": binding_id,
+        "state": state,
+        "request_hash": request_hash,
+        "record_snapshot_hash":
+            record_snapshot_hash,
+        "target_binding_hash":
+            target_binding_hash,
+        "reserved_at_utc": reserved_at_utc,
+        "gate_id": gate_id,
+        "completed_at_utc": completed_at_utc,
+    }
+
+
+def _durable_gate_journal_entry_integrity_valid(
+    entry: Any,
+) -> bool:
+    try:
+        if not isinstance(
+            entry,
+            DurableExecutionGateJournalEntry,
+        ):
+            return False
+
+        if not _durable_prefixed_hex_id(
+            entry.binding_id,
+            "xeb_",
+        ):
+            return False
+
+        if entry.state not in (
+            DURABLE_GATE_JOURNAL_STATE_RESERVED,
+            DURABLE_GATE_JOURNAL_STATE_COMPLETED,
+        ):
+            return False
+
+        for hash_value in (
+            entry.request_hash,
+            entry.record_snapshot_hash,
+            entry.target_binding_hash,
+            entry.entry_hash,
+        ):
+            if not _synthetic_plan_hash_value(
+                hash_value
+            ):
+                return False
+
+        reserved_at = _parse_utc(
+            entry.reserved_at_utc,
+            "entry.reserved_at_utc",
+        )
+
+        if (
+            _iso_utc(reserved_at)
+            != entry.reserved_at_utc
+        ):
+            return False
+
+        if (
+            entry.state
+            == DURABLE_GATE_JOURNAL_STATE_RESERVED
+        ):
+            if (
+                entry.gate_id is not None
+                or entry.completed_at_utc is not None
+            ):
+                return False
+
+        else:
+            if not _durable_prefixed_hex_id(
+                entry.gate_id,
+                "xgate_",
+            ):
+                return False
+
+            if entry.completed_at_utc is None:
+                return False
+
+            completed_at = _parse_utc(
+                entry.completed_at_utc,
+                "entry.completed_at_utc",
+            )
+
+            if (
+                _iso_utc(completed_at)
+                != entry.completed_at_utc
+                or completed_at < reserved_at
+            ):
+                return False
+
+        payload = _durable_gate_journal_entry_payload(
+            binding_id=entry.binding_id,
+            state=entry.state,
+            request_hash=entry.request_hash,
+            record_snapshot_hash=(
+                entry.record_snapshot_hash
+            ),
+            target_binding_hash=(
+                entry.target_binding_hash
+            ),
+            reserved_at_utc=entry.reserved_at_utc,
+            gate_id=entry.gate_id,
+            completed_at_utc=(
+                entry.completed_at_utc
+            ),
+        )
+
+        return (
+            entry.entry_hash
+            == _canonical_hash(payload)
+        )
+
+    except Exception:
+        return False
+
+
+class DurableExecutionGateConsumptionJournal:
+    """Private restart-safe consumption journal.
+
+    Both reserved and completed entries block automatic replay.
+    A reserved entry after a crash is intentionally ambiguous and
+    requires review rather than automatic retry.
+    """
+
+    def __init__(
+        self,
+        path: Any,
+    ) -> None:
+        try:
+            self._path = Path(
+                os.fspath(path)
+            )
+        except (TypeError, ValueError) as exc:
+            raise DurableExecutionGateJournalError(
+                "journal path is invalid"
+            ) from exc
+
+        if (
+            not self._path.is_absolute()
+            or not self._path.name
+        ):
+            raise DurableExecutionGateJournalError(
+                "journal path must be an absolute file path"
+            )
+
+        self._lock_path = self._path.with_name(
+            self._path.name + ".lock"
+        )
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    def _validate_parent(self) -> None:
+        parent = self._path.parent
+
+        try:
+            info = os.lstat(parent)
+        except OSError as exc:
+            raise DurableExecutionGateJournalError(
+                "journal parent is unavailable"
+            ) from exc
+
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) & 0o022
+        ):
+            raise DurableExecutionGateJournalError(
+                "journal parent is not private and trusted"
+            )
+
+    def _open_lock(self) -> int:
+        self._validate_parent()
+
+        if not hasattr(os, "O_NOFOLLOW"):
+            raise DurableExecutionGateJournalError(
+                "platform lacks no-follow file support"
+            )
+
+        flags = (
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_NOFOLLOW
+        )
+
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+
+        try:
+            fd = os.open(
+                self._lock_path,
+                flags,
+                0o600,
+            )
+        except OSError as exc:
+            raise DurableExecutionGateJournalError(
+                "journal lock file could not be opened safely"
+            ) from exc
+
+        try:
+            info = os.fstat(fd)
+
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.geteuid()
+                or info.st_nlink != 1
+                or stat.S_IMODE(info.st_mode)
+                != 0o600
+            ):
+                raise DurableExecutionGateJournalError(
+                    "journal lock file is not private and trusted"
+                )
+
+            fcntl.flock(
+                fd,
+                fcntl.LOCK_EX,
+            )
+
+            return fd
+
+        except Exception:
+            os.close(fd)
+            raise
+
+    @staticmethod
+    def _close_lock(fd: int) -> None:
+        try:
+            fcntl.flock(
+                fd,
+                fcntl.LOCK_UN,
+            )
+        finally:
+            os.close(fd)
+
+    def _validate_existing_journal_file(
+        self,
+        info: os.stat_result,
+    ) -> None:
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode)
+            != 0o600
+            or info.st_size
+            > DURABLE_GATE_JOURNAL_MAX_BYTES
+        ):
+            raise DurableExecutionGateJournalError(
+                "journal file is not private and trusted"
+            )
+
+    def _read_entries_locked(
+        self,
+    ) -> list[DurableExecutionGateJournalEntry]:
+        if not os.path.lexists(self._path):
+            return []
+
+        flags = (
+            os.O_RDONLY
+            | os.O_NOFOLLOW
+        )
+
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+
+        try:
+            fd = os.open(
+                self._path,
+                flags,
+            )
+        except OSError as exc:
+            raise DurableExecutionGateJournalError(
+                "journal file could not be opened safely"
+            ) from exc
+
+        try:
+            info = os.fstat(fd)
+
+            self._validate_existing_journal_file(
+                info
+            )
+
+            chunks: list[bytes] = []
+            total = 0
+
+            while True:
+                chunk = os.read(
+                    fd,
+                    65_536,
+                )
+
+                if not chunk:
+                    break
+
+                total += len(chunk)
+
+                if (
+                    total
+                    > DURABLE_GATE_JOURNAL_MAX_BYTES
+                ):
+                    raise DurableExecutionGateJournalError(
+                        "journal file exceeds size limit"
+                    )
+
+                chunks.append(chunk)
+
+        finally:
+            os.close(fd)
+
+        raw = b"".join(chunks)
+
+        if not raw:
+            raise DurableExecutionGateJournalError(
+                "journal file is empty"
+            )
+
+        try:
+            document = json.loads(
+                raw.decode("utf-8")
+            )
+        except (
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+        ) as exc:
+            raise DurableExecutionGateJournalError(
+                "journal file is malformed"
+            ) from exc
+
+        if (
+            not isinstance(document, dict)
+            or set(document)
+            != {
+                "policy_version",
+                "schema_version",
+                "entries",
+                "journal_hash",
+            }
+            or document["policy_version"]
+            != DURABLE_GATE_JOURNAL_POLICY_VERSION
+            or type(document["schema_version"])
+            is not int
+            or document["schema_version"]
+            != DURABLE_GATE_JOURNAL_SCHEMA_VERSION
+            or not isinstance(
+                document["entries"],
+                list,
+            )
+            or not _synthetic_plan_hash_value(
+                document["journal_hash"]
+            )
+        ):
+            raise DurableExecutionGateJournalError(
+                "journal document is invalid"
+            )
+
+        expected_keys = {
+            "binding_id",
+            "state",
+            "request_hash",
+            "record_snapshot_hash",
+            "target_binding_hash",
+            "reserved_at_utc",
+            "gate_id",
+            "completed_at_utc",
+            "entry_hash",
+        }
+
+        entries = []
+
+        for raw_entry in document["entries"]:
+            if (
+                not isinstance(raw_entry, dict)
+                or set(raw_entry)
+                != expected_keys
+            ):
+                raise DurableExecutionGateJournalError(
+                    "journal entry shape is invalid"
+                )
+
+            try:
+                entry = (
+                    DurableExecutionGateJournalEntry(
+                        **raw_entry
+                    )
+                )
+            except TypeError as exc:
+                raise DurableExecutionGateJournalError(
+                    "journal entry could not be decoded"
+                ) from exc
+
+            if not (
+                _durable_gate_journal_entry_integrity_valid(
+                    entry
+                )
+            ):
+                raise DurableExecutionGateJournalError(
+                    "journal entry integrity is invalid"
+                )
+
+            entries.append(entry)
+
+        binding_ids = [
+            entry.binding_id
+            for entry in entries
+        ]
+
+        if (
+            binding_ids
+            != sorted(binding_ids)
+            or len(binding_ids)
+            != len(set(binding_ids))
+        ):
+            raise DurableExecutionGateJournalError(
+                "journal binding IDs are duplicated or unsorted"
+            )
+
+        gate_ids = [
+            entry.gate_id
+            for entry in entries
+            if entry.gate_id is not None
+        ]
+
+        if len(gate_ids) != len(set(gate_ids)):
+            raise DurableExecutionGateJournalError(
+                "journal gate IDs are duplicated"
+            )
+
+        payload = {
+            "policy_version":
+                DURABLE_GATE_JOURNAL_POLICY_VERSION,
+            "schema_version":
+                DURABLE_GATE_JOURNAL_SCHEMA_VERSION,
+            "entries": [
+                asdict(entry)
+                for entry in entries
+            ],
+        }
+
+        if (
+            document["journal_hash"]
+            != _canonical_hash(payload)
+        ):
+            raise DurableExecutionGateJournalError(
+                "journal document hash is invalid"
+            )
+
+        return entries
+
+    def _write_entries_locked(
+        self,
+        entries: list[
+            DurableExecutionGateJournalEntry
+        ],
+    ) -> None:
+        ordered = sorted(
+            entries,
+            key=lambda entry: entry.binding_id,
+        )
+
+        if (
+            len({
+                entry.binding_id
+                for entry in ordered
+            })
+            != len(ordered)
+        ):
+            raise DurableExecutionGateJournalError(
+                "journal contains duplicate bindings"
+            )
+
+        for entry in ordered:
+            if not (
+                _durable_gate_journal_entry_integrity_valid(
+                    entry
+                )
+            ):
+                raise DurableExecutionGateJournalError(
+                    "refusing to write invalid journal entry"
+                )
+
+        payload = {
+            "policy_version":
+                DURABLE_GATE_JOURNAL_POLICY_VERSION,
+            "schema_version":
+                DURABLE_GATE_JOURNAL_SCHEMA_VERSION,
+            "entries": [
+                asdict(entry)
+                for entry in ordered
+            ],
+        }
+
+        document = dict(payload)
+        document["journal_hash"] = (
+            _canonical_hash(payload)
+        )
+
+        try:
+            encoded = (
+                json.dumps(
+                    document,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise DurableExecutionGateJournalError(
+                "journal state is not serializable"
+            ) from exc
+
+        if (
+            len(encoded)
+            > DURABLE_GATE_JOURNAL_MAX_BYTES
+        ):
+            raise DurableExecutionGateJournalError(
+                "journal state exceeds size limit"
+            )
+
+        if os.path.lexists(self._path):
+            try:
+                current = os.lstat(
+                    self._path
+                )
+            except OSError as exc:
+                raise DurableExecutionGateJournalError(
+                    "existing journal could not be inspected"
+                ) from exc
+
+            self._validate_existing_journal_file(
+                current
+            )
+
+        temp_fd = None
+        temp_name = None
+
+        try:
+            temp_fd, temp_name = tempfile.mkstemp(
+                prefix=(
+                    "."
+                    + self._path.name
+                    + ".tmp."
+                ),
+                dir=str(self._path.parent),
+            )
+
+            os.fchmod(
+                temp_fd,
+                0o600,
+            )
+
+            offset = 0
+
+            while offset < len(encoded):
+                written = os.write(
+                    temp_fd,
+                    encoded[offset:],
+                )
+
+                if written <= 0:
+                    raise DurableExecutionGateJournalError(
+                        "journal temporary write did not progress"
+                    )
+
+                offset += written
+
+            os.fsync(temp_fd)
+            os.close(temp_fd)
+            temp_fd = None
+
+            os.replace(
+                temp_name,
+                self._path,
+            )
+            temp_name = None
+
+            final_info = os.lstat(
+                self._path
+            )
+
+            self._validate_existing_journal_file(
+                final_info
+            )
+
+            directory_flags = os.O_RDONLY
+
+            if hasattr(os, "O_DIRECTORY"):
+                directory_flags |= os.O_DIRECTORY
+
+            if hasattr(os, "O_CLOEXEC"):
+                directory_flags |= os.O_CLOEXEC
+
+            directory_fd = os.open(
+                self._path.parent,
+                directory_flags,
+            )
+
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+
+        except DurableExecutionGateJournalError:
+            raise
+
+        except OSError as exc:
+            raise DurableExecutionGateJournalError(
+                "journal atomic persistence failed"
+            ) from exc
+
+        finally:
+            if temp_fd is not None:
+                os.close(temp_fd)
+
+            if (
+                temp_name is not None
+                and os.path.lexists(temp_name)
+            ):
+                try:
+                    os.unlink(temp_name)
+                except OSError:
+                    pass
+
+    def _reserve(
+        self,
+        binding: Any,
+    ) -> DurableExecutionGateJournalEntry:
+        if (
+            not isinstance(
+                binding,
+                TrustedExecutionBindingDecision,
+            )
+            or not (
+                _trusted_execution_binding_integrity_valid(
+                    binding
+                )
+            )
+        ):
+            raise DurableExecutionGateJournalError(
+                "trusted binding is invalid"
+            )
+
+        now = _aware_utc(
+            _utc_now()
+        )
+
+        if now is None:
+            raise DurableExecutionGateJournalError(
+                "internal journal clock is invalid"
+            )
+
+        reserved_at_utc = _iso_utc(now)
+
+        payload = (
+            _durable_gate_journal_entry_payload(
+                binding_id=binding.binding_id,
+                state=(
+                    DURABLE_GATE_JOURNAL_STATE_RESERVED
+                ),
+                request_hash=binding.request_hash,
+                record_snapshot_hash=(
+                    binding.record_snapshot_hash
+                ),
+                target_binding_hash=(
+                    binding.target_binding_hash
+                ),
+                reserved_at_utc=reserved_at_utc,
+                gate_id=None,
+                completed_at_utc=None,
+            )
+        )
+
+        entry = DurableExecutionGateJournalEntry(
+            binding_id=binding.binding_id,
+            state=(
+                DURABLE_GATE_JOURNAL_STATE_RESERVED
+            ),
+            request_hash=binding.request_hash,
+            record_snapshot_hash=(
+                binding.record_snapshot_hash
+            ),
+            target_binding_hash=(
+                binding.target_binding_hash
+            ),
+            reserved_at_utc=reserved_at_utc,
+            gate_id=None,
+            completed_at_utc=None,
+            entry_hash=_canonical_hash(payload),
+        )
+
+        lock_fd = self._open_lock()
+
+        try:
+            entries = self._read_entries_locked()
+
+            if any(
+                existing.binding_id
+                == binding.binding_id
+                for existing in entries
+            ):
+                raise DurableExecutionGateJournalError(
+                    "execution binding is already durably reserved or consumed"
+                )
+
+            self._write_entries_locked(
+                entries + [entry]
+            )
+
+            return entry
+
+        finally:
+            self._close_lock(lock_fd)
+
+    def _rollback_reservation(
+        self,
+        binding_id: Any,
+    ) -> None:
+        lock_fd = self._open_lock()
+
+        try:
+            entries = self._read_entries_locked()
+
+            matches = [
+                entry
+                for entry in entries
+                if entry.binding_id == binding_id
+            ]
+
+            if (
+                len(matches) != 1
+                or matches[0].state
+                != DURABLE_GATE_JOURNAL_STATE_RESERVED
+            ):
+                raise DurableExecutionGateJournalError(
+                    "durable reservation cannot be rolled back safely"
+                )
+
+            self._write_entries_locked([
+                entry
+                for entry in entries
+                if entry.binding_id != binding_id
+            ])
+
+        finally:
+            self._close_lock(lock_fd)
+
+    def _complete(
+        self,
+        binding_id: Any,
+        gate: Any,
+    ) -> DurableExecutionGateJournalEntry:
+        if not (
+            isinstance(
+                gate,
+                OneShotExecutionGateDecision,
+            )
+            and _one_shot_execution_gate_integrity_valid(
+                gate
+            )
+            and gate.binding_id == binding_id
+        ):
+            raise DurableExecutionGateJournalError(
+                "completed gate is invalid"
+            )
+
+        lock_fd = self._open_lock()
+
+        try:
+            entries = self._read_entries_locked()
+
+            matches = [
+                entry
+                for entry in entries
+                if entry.binding_id == binding_id
+            ]
+
+            if (
+                len(matches) != 1
+                or matches[0].state
+                != DURABLE_GATE_JOURNAL_STATE_RESERVED
+            ):
+                raise DurableExecutionGateJournalError(
+                    "durable reservation is unavailable"
+                )
+
+            reserved = matches[0]
+
+            if (
+                reserved.request_hash
+                != gate.request_hash
+                or reserved.record_snapshot_hash
+                != gate.record_snapshot_hash
+                or reserved.target_binding_hash
+                != gate.target_binding_hash
+            ):
+                raise DurableExecutionGateJournalError(
+                    "gate does not match durable reservation"
+                )
+
+            payload = (
+                _durable_gate_journal_entry_payload(
+                    binding_id=reserved.binding_id,
+                    state=(
+                        DURABLE_GATE_JOURNAL_STATE_COMPLETED
+                    ),
+                    request_hash=(
+                        reserved.request_hash
+                    ),
+                    record_snapshot_hash=(
+                        reserved.record_snapshot_hash
+                    ),
+                    target_binding_hash=(
+                        reserved.target_binding_hash
+                    ),
+                    reserved_at_utc=(
+                        reserved.reserved_at_utc
+                    ),
+                    gate_id=gate.gate_id,
+                    completed_at_utc=(
+                        gate.evaluated_at_utc
+                    ),
+                )
+            )
+
+            completed = (
+                DurableExecutionGateJournalEntry(
+                    binding_id=reserved.binding_id,
+                    state=(
+                        DURABLE_GATE_JOURNAL_STATE_COMPLETED
+                    ),
+                    request_hash=(
+                        reserved.request_hash
+                    ),
+                    record_snapshot_hash=(
+                        reserved.record_snapshot_hash
+                    ),
+                    target_binding_hash=(
+                        reserved.target_binding_hash
+                    ),
+                    reserved_at_utc=(
+                        reserved.reserved_at_utc
+                    ),
+                    gate_id=gate.gate_id,
+                    completed_at_utc=(
+                        gate.evaluated_at_utc
+                    ),
+                    entry_hash=(
+                        _canonical_hash(payload)
+                    ),
+                )
+            )
+
+            if not (
+                _durable_gate_journal_entry_integrity_valid(
+                    completed
+                )
+            ):
+                raise DurableExecutionGateJournalError(
+                    "completed journal entry failed integrity"
+                )
+
+            self._write_entries_locked([
+                completed
+                if entry.binding_id == binding_id
+                else entry
+                for entry in entries
+            ])
+
+            return completed
+
+        finally:
+            self._close_lock(lock_fd)
+
+    def entry_for_binding(
+        self,
+        binding_id: Any,
+    ) -> Optional[
+        DurableExecutionGateJournalEntry
+    ]:
+        if not _durable_prefixed_hex_id(
+            binding_id,
+            "xeb_",
+        ):
+            raise DurableExecutionGateJournalError(
+                "binding ID is invalid"
+            )
+
+        lock_fd = self._open_lock()
+
+        try:
+            entries = self._read_entries_locked()
+
+            matches = [
+                entry
+                for entry in entries
+                if entry.binding_id == binding_id
+            ]
+
+            if len(matches) > 1:
+                raise DurableExecutionGateJournalError(
+                    "journal contains duplicate binding IDs"
+                )
+
+            return (
+                matches[0]
+                if matches
+                else None
+            )
+
+        finally:
+            self._close_lock(lock_fd)
+
+
+def satisfy_durable_one_shot_execution_gate(
+    *,
+    registry: Any,
+    approval_id: Any,
+    request: Any,
+    record: Any,
+    journal: Any,
+) -> OneShotExecutionGateDecision:
+    """Wrap the verified 6D-B gate with restart-safe consumption state.
+
+    A crash after durable reservation is intentionally fail-closed:
+    the reserved entry blocks automatic replay and requires review.
+    """
+
+    if not isinstance(
+        journal,
+        DurableExecutionGateConsumptionJournal,
+    ):
+        raise DurableOneShotExecutionGateError(
+            "journal is invalid"
+        )
+
+    try:
+        binding = build_trusted_execution_binding(
+            registry=registry,
+            approval_id=approval_id,
+            request=request,
+            record=record,
+        )
+    except TrustedExecutionBindingError as exc:
+        raise DurableOneShotExecutionGateError(
+            "trusted execution binding is unavailable"
+        ) from exc
+
+    try:
+        journal._reserve(binding)
+    except DurableExecutionGateJournalError as exc:
+        raise DurableOneShotExecutionGateError(
+            "durable reservation failed"
+        ) from exc
+
+    try:
+        gate = satisfy_one_shot_execution_gate(
+            registry=registry,
+            approval_id=approval_id,
+            request=request,
+            record=record,
+        )
+
+    except OneShotExecutionGateError as gate_exc:
+        try:
+            journal._rollback_reservation(
+                binding.binding_id
+            )
+        except DurableExecutionGateJournalError as rollback_exc:
+            raise DurableOneShotExecutionGateError(
+                "gate failed and durable reservation rollback failed; "
+                "manual recovery is required"
+            ) from rollback_exc
+
+        raise DurableOneShotExecutionGateError(
+            "one-shot gate failed; durable reservation was rolled back"
+        ) from gate_exc
+
+    try:
+        journal._complete(
+            binding.binding_id,
+            gate,
+        )
+    except DurableExecutionGateJournalError as exc:
+        raise DurableOneShotExecutionGateError(
+            "gate was consumed but durable completion failed; "
+            "reserved state must be treated as consumed"
+        ) from exc
+
+    return gate
 __all__ = [
     "APPROVAL_POLICY_VERSION",
     "APPROVAL_CHALLENGE_LIFETIME_SECONDS",
@@ -5540,6 +6598,14 @@ __all__ = [
     "EXECUTION_GATE_POLICY_VERSION",
     "EXECUTION_GATE_SCHEMA_VERSION",
     "EXECUTION_GATE_STATUS_SATISFIED",
+    "DurableExecutionGateJournalEntry",
+    "DurableExecutionGateConsumptionJournal",
+    "DurableExecutionGateJournalError",
+    "DurableOneShotExecutionGateError",
+    "DURABLE_GATE_JOURNAL_POLICY_VERSION",
+    "DURABLE_GATE_JOURNAL_SCHEMA_VERSION",
+    "DURABLE_GATE_JOURNAL_STATE_RESERVED",
+    "DURABLE_GATE_JOURNAL_STATE_COMPLETED",
     "AuthorizationDecision",
     "AuthorizationError",
     "AuthorizationRequest",
@@ -5588,6 +6654,7 @@ __all__ = [
     "build_drive_record_with_synthetic_run_evidence",
     "build_trusted_execution_binding",
     "satisfy_one_shot_execution_gate",
+    "satisfy_durable_one_shot_execution_gate",
     "record_snapshot_hash",
     "request_hash",
 ]

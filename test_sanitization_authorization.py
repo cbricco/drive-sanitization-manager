@@ -2,6 +2,10 @@ from dataclasses import FrozenInstanceError, fields, replace
 from datetime import datetime, timedelta, timezone
 import inspect
 import json
+import os
+from pathlib import Path
+import stat
+import tempfile
 import unittest
 import sanitization_authorization as auth
 from unittest.mock import patch
@@ -8037,6 +8041,737 @@ class Phase5AuthorizationR2Tests(unittest.TestCase):
             self.assertNotIn(
                 forbidden,
                 source,
+            )
+
+    def _phase6dc_ready(
+        self,
+        *,
+        request_id="PHASE6DC-REQ",
+    ):
+        (
+            registry,
+            record,
+            request,
+            _challenge,
+            evidence,
+            _revalidation,
+            _snapshot,
+            at,
+        ) = self._phase6da_success(
+            request_id=request_id
+        )
+
+        binding = auth.build_trusted_execution_binding(
+            registry=registry,
+            approval_id=evidence.approval_id,
+            request=request,
+            record=record,
+        )
+
+        return (
+            registry,
+            record,
+            request,
+            evidence,
+            binding,
+            at,
+        )
+
+    def test_phase6dc_success_persists_completed_private_journal(
+        self,
+    ):
+        (
+            registry,
+            record,
+            request,
+            evidence,
+            binding,
+            at,
+        ) = self._phase6dc_ready(
+            request_id="PHASE6DC-SUCCESS"
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "gate-journal.json"
+
+            journal = (
+                auth.DurableExecutionGateConsumptionJournal(
+                    path
+                )
+            )
+
+            with patch(
+                "sanitization_authorization._utc_now",
+                return_value=at + timedelta(seconds=2),
+            ):
+                gate = (
+                    auth.satisfy_durable_one_shot_execution_gate(
+                        registry=registry,
+                        approval_id=evidence.approval_id,
+                        request=request,
+                        record=record,
+                        journal=journal,
+                    )
+                )
+
+            entry = journal.entry_for_binding(
+                binding.binding_id
+            )
+
+            self.assertIsNotNone(entry)
+            self.assertEqual(
+                entry.state,
+                auth.DURABLE_GATE_JOURNAL_STATE_COMPLETED,
+            )
+            self.assertEqual(
+                entry.gate_id,
+                gate.gate_id,
+            )
+            self.assertTrue(
+                auth._durable_gate_journal_entry_integrity_valid(
+                    entry
+                )
+            )
+
+            self.assertEqual(
+                stat.S_IMODE(path.stat().st_mode),
+                0o600,
+            )
+            self.assertEqual(
+                stat.S_IMODE(
+                    Path(
+                        str(path) + ".lock"
+                    ).stat().st_mode
+                ),
+                0o600,
+            )
+
+    def test_phase6dc_new_journal_instance_rejects_completed_replay(
+        self,
+    ):
+        (
+            registry,
+            record,
+            request,
+            evidence,
+            binding,
+            at,
+        ) = self._phase6dc_ready(
+            request_id="PHASE6DC-RESTART"
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "gate-journal.json"
+
+            first_journal = (
+                auth.DurableExecutionGateConsumptionJournal(
+                    path
+                )
+            )
+
+            with patch(
+                "sanitization_authorization._utc_now",
+                return_value=at + timedelta(seconds=2),
+            ):
+                auth.satisfy_durable_one_shot_execution_gate(
+                    registry=registry,
+                    approval_id=evidence.approval_id,
+                    request=request,
+                    record=record,
+                    journal=first_journal,
+                )
+
+            restarted = (
+                auth.DurableExecutionGateConsumptionJournal(
+                    path
+                )
+            )
+
+            entry = restarted.entry_for_binding(
+                binding.binding_id
+            )
+
+            self.assertEqual(
+                entry.state,
+                auth.DURABLE_GATE_JOURNAL_STATE_COMPLETED,
+            )
+
+            with patch(
+                "sanitization_authorization._utc_now",
+                return_value=at + timedelta(seconds=2),
+            ):
+                with self.assertRaises(
+                    auth.DurableOneShotExecutionGateError
+                ):
+                    auth.satisfy_durable_one_shot_execution_gate(
+                        registry=registry,
+                        approval_id=evidence.approval_id,
+                        request=request,
+                        record=record,
+                        journal=restarted,
+                    )
+
+    def test_phase6dc_reserved_crash_state_blocks_automatic_replay(
+        self,
+    ):
+        (
+            registry,
+            record,
+            request,
+            evidence,
+            binding,
+            at,
+        ) = self._phase6dc_ready(
+            request_id="PHASE6DC-RESERVED"
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "gate-journal.json"
+
+            journal = (
+                auth.DurableExecutionGateConsumptionJournal(
+                    path
+                )
+            )
+
+            with patch(
+                "sanitization_authorization._utc_now",
+                return_value=at + timedelta(seconds=2),
+            ):
+                journal._reserve(binding)
+
+            restarted = (
+                auth.DurableExecutionGateConsumptionJournal(
+                    path
+                )
+            )
+
+            entry = restarted.entry_for_binding(
+                binding.binding_id
+            )
+
+            self.assertEqual(
+                entry.state,
+                auth.DURABLE_GATE_JOURNAL_STATE_RESERVED,
+            )
+
+            with patch(
+                "sanitization_authorization._utc_now",
+                return_value=at + timedelta(seconds=2),
+            ):
+                with self.assertRaises(
+                    auth.DurableOneShotExecutionGateError
+                ):
+                    auth.satisfy_durable_one_shot_execution_gate(
+                        registry=registry,
+                        approval_id=evidence.approval_id,
+                        request=request,
+                        record=record,
+                        journal=restarted,
+                    )
+
+    def test_phase6dc_normal_gate_failure_rolls_back_reservation(
+        self,
+    ):
+        (
+            registry,
+            record,
+            request,
+            evidence,
+            binding,
+            at,
+        ) = self._phase6dc_ready(
+            request_id="PHASE6DC-ROLLBACK"
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            journal = (
+                auth.DurableExecutionGateConsumptionJournal(
+                    Path(directory) / "gate-journal.json"
+                )
+            )
+
+            with (
+                patch(
+                    "sanitization_authorization._utc_now",
+                    return_value=at + timedelta(seconds=2),
+                ),
+                patch(
+                    "sanitization_authorization."
+                    "satisfy_one_shot_execution_gate",
+                    side_effect=auth.OneShotExecutionGateError(
+                        "synthetic failure"
+                    ),
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    auth.DurableOneShotExecutionGateError,
+                    "rolled back",
+                ):
+                    auth.satisfy_durable_one_shot_execution_gate(
+                        registry=registry,
+                        approval_id=evidence.approval_id,
+                        request=request,
+                        record=record,
+                        journal=journal,
+                    )
+
+            self.assertIsNone(
+                journal.entry_for_binding(
+                    binding.binding_id
+                )
+            )
+
+    def test_phase6dc_completion_failure_preserves_reserved_fail_closed_state(
+        self,
+    ):
+        (
+            registry,
+            record,
+            request,
+            evidence,
+            binding,
+            at,
+        ) = self._phase6dc_ready(
+            request_id="PHASE6DC-COMPLETE-FAIL"
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            journal = (
+                auth.DurableExecutionGateConsumptionJournal(
+                    Path(directory) / "gate-journal.json"
+                )
+            )
+
+            with (
+                patch(
+                    "sanitization_authorization._utc_now",
+                    return_value=at + timedelta(seconds=2),
+                ),
+                patch.object(
+                    journal,
+                    "_complete",
+                    side_effect=(
+                        auth.DurableExecutionGateJournalError(
+                            "synthetic completion failure"
+                        )
+                    ),
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    auth.DurableOneShotExecutionGateError,
+                    "treated as consumed",
+                ):
+                    auth.satisfy_durable_one_shot_execution_gate(
+                        registry=registry,
+                        approval_id=evidence.approval_id,
+                        request=request,
+                        record=record,
+                        journal=journal,
+                    )
+
+            entry = journal.entry_for_binding(
+                binding.binding_id
+            )
+
+            self.assertEqual(
+                entry.state,
+                auth.DURABLE_GATE_JOURNAL_STATE_RESERVED,
+            )
+
+            self.assertIn(
+                binding.binding_id,
+                registry._consumed_execution_bindings,
+            )
+
+    def test_phase6dc_malformed_journal_fails_closed(
+        self,
+    ):
+        (
+            _registry,
+            _record,
+            _request,
+            _evidence,
+            binding,
+            _at,
+        ) = self._phase6dc_ready(
+            request_id="PHASE6DC-MALFORMED"
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "gate-journal.json"
+            path.write_text(
+                "{broken",
+                encoding="utf-8",
+            )
+            path.chmod(0o600)
+
+            journal = (
+                auth.DurableExecutionGateConsumptionJournal(
+                    path
+                )
+            )
+
+            with self.assertRaises(
+                auth.DurableExecutionGateJournalError
+            ):
+                journal.entry_for_binding(
+                    binding.binding_id
+                )
+
+    def test_phase6dc_journal_hash_tampering_fails_closed(
+        self,
+    ):
+        (
+            _registry,
+            _record,
+            _request,
+            _evidence,
+            binding,
+            at,
+        ) = self._phase6dc_ready(
+            request_id="PHASE6DC-JOURNAL-HASH"
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "gate-journal.json"
+
+            journal = (
+                auth.DurableExecutionGateConsumptionJournal(
+                    path
+                )
+            )
+
+            with patch(
+                "sanitization_authorization._utc_now",
+                return_value=at + timedelta(seconds=2),
+            ):
+                journal._reserve(binding)
+
+            document = json.loads(
+                path.read_text(encoding="utf-8")
+            )
+
+            document["journal_hash"] = (
+                "sha256:" + ("0" * 64)
+            )
+
+            path.write_text(
+                json.dumps(document),
+                encoding="utf-8",
+            )
+            path.chmod(0o600)
+
+            restarted = (
+                auth.DurableExecutionGateConsumptionJournal(
+                    path
+                )
+            )
+
+            with self.assertRaises(
+                auth.DurableExecutionGateJournalError
+            ):
+                restarted.entry_for_binding(
+                    binding.binding_id
+                )
+
+    def test_phase6dc_entry_tampering_fails_closed(
+        self,
+    ):
+        (
+            _registry,
+            _record,
+            _request,
+            _evidence,
+            binding,
+            at,
+        ) = self._phase6dc_ready(
+            request_id="PHASE6DC-ENTRY-TAMPER"
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "gate-journal.json"
+
+            journal = (
+                auth.DurableExecutionGateConsumptionJournal(
+                    path
+                )
+            )
+
+            with patch(
+                "sanitization_authorization._utc_now",
+                return_value=at + timedelta(seconds=2),
+            ):
+                journal._reserve(binding)
+
+            document = json.loads(
+                path.read_text(encoding="utf-8")
+            )
+
+            document["entries"][0][
+                "target_binding_hash"
+            ] = "sha256:" + ("1" * 64)
+
+            path.write_text(
+                json.dumps(document),
+                encoding="utf-8",
+            )
+            path.chmod(0o600)
+
+            restarted = (
+                auth.DurableExecutionGateConsumptionJournal(
+                    path
+                )
+            )
+
+            with self.assertRaises(
+                auth.DurableExecutionGateJournalError
+            ):
+                restarted.entry_for_binding(
+                    binding.binding_id
+                )
+
+    def test_phase6dc_insecure_permissions_fail_closed(
+        self,
+    ):
+        (
+            _registry,
+            _record,
+            _request,
+            _evidence,
+            binding,
+            at,
+        ) = self._phase6dc_ready(
+            request_id="PHASE6DC-MODE"
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "gate-journal.json"
+
+            journal = (
+                auth.DurableExecutionGateConsumptionJournal(
+                    path
+                )
+            )
+
+            with patch(
+                "sanitization_authorization._utc_now",
+                return_value=at + timedelta(seconds=2),
+            ):
+                journal._reserve(binding)
+
+            path.chmod(0o644)
+
+            restarted = (
+                auth.DurableExecutionGateConsumptionJournal(
+                    path
+                )
+            )
+
+            with self.assertRaises(
+                auth.DurableExecutionGateJournalError
+            ):
+                restarted.entry_for_binding(
+                    binding.binding_id
+                )
+
+    def test_phase6dc_symlink_journal_fails_closed(
+        self,
+    ):
+        (
+            _registry,
+            _record,
+            _request,
+            _evidence,
+            binding,
+            _at,
+        ) = self._phase6dc_ready(
+            request_id="PHASE6DC-SYMLINK"
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            directory_path = Path(directory)
+            target = directory_path / "target.json"
+            journal_path = (
+                directory_path / "gate-journal.json"
+            )
+
+            target.write_text(
+                "{}",
+                encoding="utf-8",
+            )
+            target.chmod(0o600)
+
+            os.symlink(
+                target,
+                journal_path,
+            )
+
+            journal = (
+                auth.DurableExecutionGateConsumptionJournal(
+                    journal_path
+                )
+            )
+
+            with self.assertRaises(
+                auth.DurableExecutionGateJournalError
+            ):
+                journal.entry_for_binding(
+                    binding.binding_id
+                )
+
+    def test_phase6dc_concurrent_durable_consumption_allows_exactly_one(
+        self,
+    ):
+        from concurrent.futures import ThreadPoolExecutor
+
+        (
+            registry,
+            record,
+            request,
+            evidence,
+            _binding,
+            at,
+        ) = self._phase6dc_ready(
+            request_id="PHASE6DC-CONCURRENT"
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            journal = (
+                auth.DurableExecutionGateConsumptionJournal(
+                    Path(directory) / "gate-journal.json"
+                )
+            )
+
+            def attempt():
+                try:
+                    return (
+                        "ok",
+                        auth.satisfy_durable_one_shot_execution_gate(
+                            registry=registry,
+                            approval_id=evidence.approval_id,
+                            request=request,
+                            record=record,
+                            journal=journal,
+                        ),
+                    )
+                except (
+                    auth.DurableOneShotExecutionGateError
+                ) as exc:
+                    return ("error", str(exc))
+
+            with patch(
+                "sanitization_authorization._utc_now",
+                return_value=at + timedelta(seconds=2),
+            ):
+                with ThreadPoolExecutor(
+                    max_workers=8
+                ) as executor:
+                    results = list(
+                        executor.map(
+                            lambda _index: attempt(),
+                            range(8),
+                        )
+                    )
+
+            successes = [
+                value
+                for status, value in results
+                if status == "ok"
+            ]
+
+            failures = [
+                value
+                for status, value in results
+                if status == "error"
+            ]
+
+            self.assertEqual(
+                len(successes),
+                1,
+            )
+            self.assertEqual(
+                len(failures),
+                7,
+            )
+
+            entry = journal.entry_for_binding(
+                successes[0].binding_id
+            )
+
+            self.assertEqual(
+                entry.state,
+                auth.DURABLE_GATE_JOURNAL_STATE_COMPLETED,
+            )
+
+    def test_phase6dc_surface_is_non_executing_and_6db_remains_available(
+        self,
+    ):
+        signature = inspect.signature(
+            auth.satisfy_durable_one_shot_execution_gate
+        )
+
+        self.assertEqual(
+            tuple(signature.parameters),
+            (
+                "registry",
+                "approval_id",
+                "request",
+                "record",
+                "journal",
+            ),
+        )
+
+        self.assertTrue(
+            callable(
+                auth.satisfy_one_shot_execution_gate
+            )
+        )
+
+        source = inspect.getsource(
+            auth.satisfy_durable_one_shot_execution_gate
+        )
+
+        for forbidden in (
+            "collect_current_drive_discovery",
+            "record_human_approval(",
+            "revalidate_approval(",
+            "subprocess",
+            "os.system",
+            "Popen",
+            "shell=True",
+            "exec(",
+            "eval(",
+            "/dev/",
+            "wipefs",
+            "blkdiscard",
+            "shred",
+            "hdparm",
+        ):
+            self.assertNotIn(
+                forbidden,
+                source,
+            )
+
+        entry_fields = {
+            field.name
+            for field in fields(
+                auth.DurableExecutionGateJournalEntry
+            )
+        }
+
+        for forbidden in (
+            "command",
+            "executor",
+            "device_handle",
+            "argv",
+            "shell",
+            "wipe",
+            "success",
+        ):
+            self.assertNotIn(
+                forbidden,
+                entry_fields,
             )
 
 if __name__ == "__main__":
