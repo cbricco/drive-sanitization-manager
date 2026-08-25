@@ -6577,6 +6577,855 @@ def satisfy_durable_one_shot_execution_gate(
         ) from exc
 
     return gate
+
+EXECUTION_HANDOFF_POLICY_VERSION = (
+    "phase6d-d-immutable-handoff-v1"
+)
+EXECUTION_HANDOFF_SCHEMA_VERSION = 1
+EXECUTION_HANDOFF_STATUS_CONTRACT_BUILT = (
+    "execution_handoff_contract_built"
+)
+
+
+class ExecutionHandoffContractError(
+    AuthorizationError
+):
+    """Execution-handoff contract inputs failed closed."""
+
+
+@dataclass(frozen=True)
+class ImmutableExecutionHandoffContract:
+    """Immutable non-executing description of one completed gate handoff.
+
+    This record carries no command, executable location, callback,
+    open device resource, or mutation capability.
+
+    The current policy-only method is explicitly not executor eligible.
+    A future destructive boundary must perform fresh target revalidation
+    and establish separate execution authority.
+    """
+
+    handoff_id: str
+    policy_version: str
+    schema_version: int
+    status: str
+
+    gate_id: str
+    binding_id: str
+
+    journal_policy_version: str
+    journal_schema_version: int
+    journal_state: str
+    journal_entry_hash: str
+
+    approval_id: str
+    challenge_id: str
+    approval_evidence_hash: str
+    revalidation_id: str
+    fresh_prerequisite_decision_id: str
+
+    request_id: str
+    request_hash: str
+    record_snapshot_hash: str
+    batch_job_id: str
+    internal_record_id: str
+
+    method_profile_id: str
+    operation: str
+    policy_only: bool
+    execution_supported: bool
+    executor_eligible: bool
+    requires_fresh_target_revalidation: bool
+
+    target_path: str
+    target_serial: Optional[str]
+    target_wwn: Optional[str]
+    target_size_bytes: int
+    target_model: Optional[str]
+    target_transport: Optional[str]
+    target_binding_hash: str
+    constraint_evaluation_hash: str
+
+    gate_evaluated_at_utc: str
+    prerequisite_valid_until_utc: str
+
+
+def _execution_handoff_payload(
+    *,
+    policy_version: str,
+    schema_version: int,
+    status: str,
+    gate_id: str,
+    binding_id: str,
+    journal_policy_version: str,
+    journal_schema_version: int,
+    journal_state: str,
+    journal_entry_hash: str,
+    approval_id: str,
+    challenge_id: str,
+    approval_evidence_hash: str,
+    revalidation_id: str,
+    fresh_prerequisite_decision_id: str,
+    request_id: str,
+    request_hash: str,
+    record_snapshot_hash: str,
+    batch_job_id: str,
+    internal_record_id: str,
+    method_profile_id: str,
+    operation: str,
+    policy_only: bool,
+    execution_supported: bool,
+    executor_eligible: bool,
+    requires_fresh_target_revalidation: bool,
+    target_path: str,
+    target_serial: Optional[str],
+    target_wwn: Optional[str],
+    target_size_bytes: int,
+    target_model: Optional[str],
+    target_transport: Optional[str],
+    target_binding_hash: str,
+    constraint_evaluation_hash: str,
+    gate_evaluated_at_utc: str,
+    prerequisite_valid_until_utc: str,
+) -> dict[str, Any]:
+    return {
+        "policy_version": policy_version,
+        "schema_version": schema_version,
+        "status": status,
+        "gate_id": gate_id,
+        "binding_id": binding_id,
+        "journal_policy_version":
+            journal_policy_version,
+        "journal_schema_version":
+            journal_schema_version,
+        "journal_state": journal_state,
+        "journal_entry_hash":
+            journal_entry_hash,
+        "approval_id": approval_id,
+        "challenge_id": challenge_id,
+        "approval_evidence_hash":
+            approval_evidence_hash,
+        "revalidation_id": revalidation_id,
+        "fresh_prerequisite_decision_id":
+            fresh_prerequisite_decision_id,
+        "request_id": request_id,
+        "request_hash": request_hash,
+        "record_snapshot_hash":
+            record_snapshot_hash,
+        "batch_job_id": batch_job_id,
+        "internal_record_id":
+            internal_record_id,
+        "method_profile_id":
+            method_profile_id,
+        "operation": operation,
+        "policy_only": policy_only,
+        "execution_supported":
+            execution_supported,
+        "executor_eligible":
+            executor_eligible,
+        "requires_fresh_target_revalidation":
+            requires_fresh_target_revalidation,
+        "target_path": target_path,
+        "target_serial": target_serial,
+        "target_wwn": target_wwn,
+        "target_size_bytes":
+            target_size_bytes,
+        "target_model": target_model,
+        "target_transport":
+            target_transport,
+        "target_binding_hash":
+            target_binding_hash,
+        "constraint_evaluation_hash":
+            constraint_evaluation_hash,
+        "gate_evaluated_at_utc":
+            gate_evaluated_at_utc,
+        "prerequisite_valid_until_utc":
+            prerequisite_valid_until_utc,
+    }
+
+
+def _immutable_execution_handoff_integrity_valid(
+    handoff: Any,
+) -> bool:
+    """Check handoff-object internal consistency only."""
+
+    try:
+        if not isinstance(
+            handoff,
+            ImmutableExecutionHandoffContract,
+        ):
+            return False
+
+        if (
+            handoff.policy_version
+            != EXECUTION_HANDOFF_POLICY_VERSION
+            or type(handoff.schema_version)
+            is not int
+            or handoff.schema_version
+            != EXECUTION_HANDOFF_SCHEMA_VERSION
+            or handoff.status
+            != EXECUTION_HANDOFF_STATUS_CONTRACT_BUILT
+        ):
+            return False
+
+        if not _durable_prefixed_hex_id(
+            handoff.gate_id,
+            "xgate_",
+        ):
+            return False
+
+        if not _durable_prefixed_hex_id(
+            handoff.binding_id,
+            "xeb_",
+        ):
+            return False
+
+        if (
+            not isinstance(
+                handoff.handoff_id,
+                str,
+            )
+            or not handoff.handoff_id.startswith(
+                "xhnd_"
+            )
+            or len(handoff.handoff_id)
+            != len("xhnd_") + 64
+            or not all(
+                character
+                in "0123456789abcdef"
+                for character
+                in handoff.handoff_id[
+                    len("xhnd_"):
+                ]
+            )
+        ):
+            return False
+
+        if (
+            handoff.journal_policy_version
+            != DURABLE_GATE_JOURNAL_POLICY_VERSION
+            or type(
+                handoff.journal_schema_version
+            )
+            is not int
+            or handoff.journal_schema_version
+            != DURABLE_GATE_JOURNAL_SCHEMA_VERSION
+            or handoff.journal_state
+            != DURABLE_GATE_JOURNAL_STATE_COMPLETED
+        ):
+            return False
+
+        for value in (
+            handoff.approval_id,
+            handoff.challenge_id,
+            handoff.request_id,
+            handoff.batch_job_id,
+            handoff.internal_record_id,
+            handoff.method_profile_id,
+            handoff.operation,
+            handoff.target_path,
+        ):
+            if not _approval_text(value):
+                return False
+
+        for value in (
+            handoff.method_profile_id,
+            handoff.operation,
+        ):
+            if not _synthetic_plan_exact_text(
+                value
+            ):
+                return False
+
+        for hash_value in (
+            handoff.journal_entry_hash,
+            handoff.approval_evidence_hash,
+            handoff.revalidation_id,
+            handoff.fresh_prerequisite_decision_id,
+            handoff.request_hash,
+            handoff.record_snapshot_hash,
+            handoff.target_binding_hash,
+            handoff.constraint_evaluation_hash,
+        ):
+            if not _synthetic_plan_hash_value(
+                hash_value
+            ):
+                return False
+
+        if (
+            type(handoff.policy_only)
+            is not bool
+            or handoff.policy_only is not True
+            or type(
+                handoff.execution_supported
+            )
+            is not bool
+            or handoff.execution_supported
+            is not False
+            or type(
+                handoff.executor_eligible
+            )
+            is not bool
+            or handoff.executor_eligible
+            is not False
+            or type(
+                handoff.requires_fresh_target_revalidation
+            )
+            is not bool
+            or handoff.requires_fresh_target_revalidation
+            is not True
+        ):
+            return False
+
+        if (
+            type(handoff.target_size_bytes)
+            is not int
+            or handoff.target_size_bytes <= 0
+        ):
+            return False
+
+        for optional_value in (
+            handoff.target_serial,
+            handoff.target_wwn,
+            handoff.target_model,
+            handoff.target_transport,
+        ):
+            if not _method_constraint_optional_text_valid(
+                optional_value
+            ):
+                return False
+
+        if not (
+            _method_constraint_identity_present(
+                handoff.target_serial
+            )
+            or _method_constraint_identity_present(
+                handoff.target_wwn
+            )
+        ):
+            return False
+
+        evaluated_at = _parse_utc(
+            handoff.gate_evaluated_at_utc,
+            "handoff.gate_evaluated_at_utc",
+        )
+
+        valid_until = _parse_utc(
+            handoff.prerequisite_valid_until_utc,
+            "handoff.prerequisite_valid_until_utc",
+        )
+
+        if (
+            _iso_utc(evaluated_at)
+            != handoff.gate_evaluated_at_utc
+            or _iso_utc(valid_until)
+            != handoff.prerequisite_valid_until_utc
+            or evaluated_at > valid_until
+        ):
+            return False
+
+        payload = _execution_handoff_payload(
+            policy_version=handoff.policy_version,
+            schema_version=handoff.schema_version,
+            status=handoff.status,
+            gate_id=handoff.gate_id,
+            binding_id=handoff.binding_id,
+            journal_policy_version=(
+                handoff.journal_policy_version
+            ),
+            journal_schema_version=(
+                handoff.journal_schema_version
+            ),
+            journal_state=handoff.journal_state,
+            journal_entry_hash=(
+                handoff.journal_entry_hash
+            ),
+            approval_id=handoff.approval_id,
+            challenge_id=handoff.challenge_id,
+            approval_evidence_hash=(
+                handoff.approval_evidence_hash
+            ),
+            revalidation_id=(
+                handoff.revalidation_id
+            ),
+            fresh_prerequisite_decision_id=(
+                handoff.fresh_prerequisite_decision_id
+            ),
+            request_id=handoff.request_id,
+            request_hash=handoff.request_hash,
+            record_snapshot_hash=(
+                handoff.record_snapshot_hash
+            ),
+            batch_job_id=handoff.batch_job_id,
+            internal_record_id=(
+                handoff.internal_record_id
+            ),
+            method_profile_id=(
+                handoff.method_profile_id
+            ),
+            operation=handoff.operation,
+            policy_only=handoff.policy_only,
+            execution_supported=(
+                handoff.execution_supported
+            ),
+            executor_eligible=(
+                handoff.executor_eligible
+            ),
+            requires_fresh_target_revalidation=(
+                handoff.requires_fresh_target_revalidation
+            ),
+            target_path=handoff.target_path,
+            target_serial=handoff.target_serial,
+            target_wwn=handoff.target_wwn,
+            target_size_bytes=(
+                handoff.target_size_bytes
+            ),
+            target_model=handoff.target_model,
+            target_transport=(
+                handoff.target_transport
+            ),
+            target_binding_hash=(
+                handoff.target_binding_hash
+            ),
+            constraint_evaluation_hash=(
+                handoff.constraint_evaluation_hash
+            ),
+            gate_evaluated_at_utc=(
+                handoff.gate_evaluated_at_utc
+            ),
+            prerequisite_valid_until_utc=(
+                handoff.prerequisite_valid_until_utc
+            ),
+        )
+
+        payload_hash = _canonical_hash(
+            payload
+        )
+
+        return (
+            handoff.handoff_id
+            == (
+                "xhnd_"
+                + payload_hash.split(":", 1)[1]
+            )
+        )
+
+    except Exception:
+        return False
+
+
+def build_immutable_execution_handoff_contract(
+    *,
+    registry: Any,
+    approval_id: Any,
+    request: Any,
+    record: Any,
+    journal: Any,
+    gate: Any,
+) -> ImmutableExecutionHandoffContract:
+    """Build a deterministic non-executing handoff contract.
+
+    The function reads already-completed journal evidence and registry-held
+    provenance.  It does not run discovery, approval, gate consumption,
+    command construction, or device mutation.
+    """
+
+    if not isinstance(
+        journal,
+        DurableExecutionGateConsumptionJournal,
+    ):
+        raise ExecutionHandoffContractError(
+            "journal is invalid"
+        )
+
+    if not isinstance(
+        gate,
+        OneShotExecutionGateDecision,
+    ):
+        raise ExecutionHandoffContractError(
+            "gate is invalid"
+        )
+
+    if not _one_shot_execution_gate_integrity_valid(
+        gate
+    ):
+        raise ExecutionHandoffContractError(
+            "gate integrity is invalid"
+        )
+
+    try:
+        binding = build_trusted_execution_binding(
+            registry=registry,
+            approval_id=approval_id,
+            request=request,
+            record=record,
+        )
+    except TrustedExecutionBindingError as exc:
+        raise ExecutionHandoffContractError(
+            "trusted binding is unavailable"
+        ) from exc
+
+    if (
+        gate.status
+        != EXECUTION_GATE_STATUS_SATISFIED
+        or gate.binding_id
+        != binding.binding_id
+        or gate.approval_id
+        != binding.approval_id
+        or gate.challenge_id
+        != binding.challenge_id
+        or gate.approval_evidence_hash
+        != binding.approval_evidence_hash
+        or gate.revalidation_id
+        != binding.revalidation_id
+        or gate.request_id
+        != binding.request_id
+        or gate.request_hash
+        != binding.request_hash
+        or gate.record_snapshot_hash
+        != binding.record_snapshot_hash
+        or gate.fresh_prerequisite_decision_id
+        != binding.fresh_prerequisite_decision_id
+        or gate.method_profile_id
+        != binding.method_profile_id
+        or gate.operation
+        != binding.operation
+        or gate.target_binding_hash
+        != binding.target_binding_hash
+        or gate.constraint_evaluation_hash
+        != binding.constraint_evaluation_hash
+        or gate.prerequisite_valid_until_utc
+        != binding.prerequisite_valid_until_utc
+    ):
+        raise ExecutionHandoffContractError(
+            "gate does not match trusted binding"
+        )
+
+    try:
+        entry = journal.entry_for_binding(
+            binding.binding_id
+        )
+    except DurableExecutionGateJournalError as exc:
+        raise ExecutionHandoffContractError(
+            "durable journal evidence is unavailable"
+        ) from exc
+
+    if (
+        entry is None
+        or entry.state
+        != DURABLE_GATE_JOURNAL_STATE_COMPLETED
+        or not (
+            _durable_gate_journal_entry_integrity_valid(
+                entry
+            )
+        )
+        or entry.binding_id
+        != binding.binding_id
+        or entry.gate_id != gate.gate_id
+        or entry.request_hash
+        != gate.request_hash
+        or entry.record_snapshot_hash
+        != gate.record_snapshot_hash
+        or entry.target_binding_hash
+        != gate.target_binding_hash
+        or entry.completed_at_utc
+        != gate.evaluated_at_utc
+    ):
+        raise ExecutionHandoffContractError(
+            "completed durable journal evidence does not match gate"
+        )
+
+    with registry._state_lock:
+        retained = (
+            registry._successful_revalidations.get(
+                approval_id
+            )
+        )
+
+    if (
+        not isinstance(retained, tuple)
+        or len(retained) != 2
+    ):
+        raise ExecutionHandoffContractError(
+            "fresh prerequisite provenance is unavailable"
+        )
+
+    retained_revalidation, fresh = retained
+
+    if (
+        not isinstance(
+            retained_revalidation,
+            ApprovalRevalidationDecision,
+        )
+        or not isinstance(
+            fresh,
+            AuthorizationDecision,
+        )
+        or not decision_integrity_valid(fresh)
+        or fresh.status
+        != STATUS_PREREQUISITES_MET
+        or fresh.reason_codes != ()
+        or fresh.target_binding is None
+        or fresh.decision_id
+        != binding.fresh_prerequisite_decision_id
+        or fresh.target_binding_hash
+        != binding.target_binding_hash
+        or fresh.request_hash
+        != binding.request_hash
+        or fresh.record_snapshot_hash
+        != binding.record_snapshot_hash
+    ):
+        raise ExecutionHandoffContractError(
+            "fresh prerequisite provenance is invalid"
+        )
+
+    target = fresh.target_binding
+
+    if not (
+        _sanitization_method_constraint_target_binding_valid(
+            target
+        )
+    ):
+        raise ExecutionHandoffContractError(
+            "fresh target identity is invalid"
+        )
+
+    target_hash = _canonical_hash(
+        asdict(target)
+    )
+
+    if (
+        target_hash
+        != binding.target_binding_hash
+        or target_hash
+        != gate.target_binding_hash
+        or target_hash
+        != entry.target_binding_hash
+        or target.path
+        != record.linux_device_path
+    ):
+        raise ExecutionHandoffContractError(
+            "fresh target identity binding mismatch"
+        )
+
+    policy = get_sanitization_method_policy(
+        request.method_profile_id
+    )
+
+    metadata = (
+        get_sanitization_method_capability_metadata(
+            request.method_profile_id
+        )
+    )
+
+    if (
+        policy is None
+        or metadata is None
+        or policy.method_profile_id
+        != request.method_profile_id
+        or metadata.method_profile_id
+        != request.method_profile_id
+        or policy.operation
+        != request.operation
+        or policy.policy_only is not True
+        or policy.execution_supported is not False
+        or metadata.capability_class
+        != "policy_only"
+    ):
+        raise ExecutionHandoffContractError(
+            "current trusted method policy is not the expected non-executable profile"
+        )
+
+    constraints = (
+        evaluate_sanitization_method_constraints(
+            request.method_profile_id,
+            target,
+        )
+    )
+
+    constraint_hash = _canonical_hash(
+        asdict(constraints)
+    )
+
+    if (
+        constraints.status
+        != METHOD_CONSTRAINT_STATUS_SATISFIED
+        or constraints.reason_codes != ()
+        or constraints.method_profile_id
+        != request.method_profile_id
+        or constraints.target_binding_hash
+        != target_hash
+        or constraint_hash
+        != binding.constraint_evaluation_hash
+        or constraint_hash
+        != gate.constraint_evaluation_hash
+    ):
+        raise ExecutionHandoffContractError(
+            "current method constraints do not match gate provenance"
+        )
+
+    if (
+        request.batch_job_id
+        != record.batch_job_id
+        or request.internal_record_id
+        != record.internal_record_id
+    ):
+        raise ExecutionHandoffContractError(
+            "request/record identity mismatch"
+        )
+
+    payload = _execution_handoff_payload(
+        policy_version=(
+            EXECUTION_HANDOFF_POLICY_VERSION
+        ),
+        schema_version=(
+            EXECUTION_HANDOFF_SCHEMA_VERSION
+        ),
+        status=(
+            EXECUTION_HANDOFF_STATUS_CONTRACT_BUILT
+        ),
+        gate_id=gate.gate_id,
+        binding_id=binding.binding_id,
+        journal_policy_version=(
+            DURABLE_GATE_JOURNAL_POLICY_VERSION
+        ),
+        journal_schema_version=(
+            DURABLE_GATE_JOURNAL_SCHEMA_VERSION
+        ),
+        journal_state=entry.state,
+        journal_entry_hash=entry.entry_hash,
+        approval_id=binding.approval_id,
+        challenge_id=binding.challenge_id,
+        approval_evidence_hash=(
+            binding.approval_evidence_hash
+        ),
+        revalidation_id=(
+            binding.revalidation_id
+        ),
+        fresh_prerequisite_decision_id=(
+            binding.fresh_prerequisite_decision_id
+        ),
+        request_id=request.request_id,
+        request_hash=binding.request_hash,
+        record_snapshot_hash=(
+            binding.record_snapshot_hash
+        ),
+        batch_job_id=request.batch_job_id,
+        internal_record_id=(
+            request.internal_record_id
+        ),
+        method_profile_id=(
+            request.method_profile_id
+        ),
+        operation=request.operation,
+        policy_only=policy.policy_only,
+        execution_supported=(
+            policy.execution_supported
+        ),
+        executor_eligible=False,
+        requires_fresh_target_revalidation=True,
+        target_path=target.path,
+        target_serial=target.serial,
+        target_wwn=target.wwn,
+        target_size_bytes=target.size_bytes,
+        target_model=target.model,
+        target_transport=target.transport,
+        target_binding_hash=target_hash,
+        constraint_evaluation_hash=(
+            constraint_hash
+        ),
+        gate_evaluated_at_utc=(
+            gate.evaluated_at_utc
+        ),
+        prerequisite_valid_until_utc=(
+            gate.prerequisite_valid_until_utc
+        ),
+    )
+
+    payload_hash = _canonical_hash(
+        payload
+    )
+
+    handoff = ImmutableExecutionHandoffContract(
+        handoff_id=(
+            "xhnd_"
+            + payload_hash.split(":", 1)[1]
+        ),
+        policy_version=(
+            EXECUTION_HANDOFF_POLICY_VERSION
+        ),
+        schema_version=(
+            EXECUTION_HANDOFF_SCHEMA_VERSION
+        ),
+        status=(
+            EXECUTION_HANDOFF_STATUS_CONTRACT_BUILT
+        ),
+        gate_id=gate.gate_id,
+        binding_id=binding.binding_id,
+        journal_policy_version=(
+            DURABLE_GATE_JOURNAL_POLICY_VERSION
+        ),
+        journal_schema_version=(
+            DURABLE_GATE_JOURNAL_SCHEMA_VERSION
+        ),
+        journal_state=entry.state,
+        journal_entry_hash=entry.entry_hash,
+        approval_id=binding.approval_id,
+        challenge_id=binding.challenge_id,
+        approval_evidence_hash=(
+            binding.approval_evidence_hash
+        ),
+        revalidation_id=(
+            binding.revalidation_id
+        ),
+        fresh_prerequisite_decision_id=(
+            binding.fresh_prerequisite_decision_id
+        ),
+        request_id=request.request_id,
+        request_hash=binding.request_hash,
+        record_snapshot_hash=(
+            binding.record_snapshot_hash
+        ),
+        batch_job_id=request.batch_job_id,
+        internal_record_id=(
+            request.internal_record_id
+        ),
+        method_profile_id=(
+            request.method_profile_id
+        ),
+        operation=request.operation,
+        policy_only=policy.policy_only,
+        execution_supported=(
+            policy.execution_supported
+        ),
+        executor_eligible=False,
+        requires_fresh_target_revalidation=True,
+        target_path=target.path,
+        target_serial=target.serial,
+        target_wwn=target.wwn,
+        target_size_bytes=target.size_bytes,
+        target_model=target.model,
+        target_transport=target.transport,
+        target_binding_hash=target_hash,
+        constraint_evaluation_hash=(
+            constraint_hash
+        ),
+        gate_evaluated_at_utc=(
+            gate.evaluated_at_utc
+        ),
+        prerequisite_valid_until_utc=(
+            gate.prerequisite_valid_until_utc
+        ),
+    )
+
+    if not _immutable_execution_handoff_integrity_valid(
+        handoff
+    ):
+        raise ExecutionHandoffContractError(
+            "constructed handoff failed integrity validation"
+        )
+
+    return handoff
 __all__ = [
     "APPROVAL_POLICY_VERSION",
     "APPROVAL_CHALLENGE_LIFETIME_SECONDS",
@@ -6606,6 +7455,11 @@ __all__ = [
     "DURABLE_GATE_JOURNAL_SCHEMA_VERSION",
     "DURABLE_GATE_JOURNAL_STATE_RESERVED",
     "DURABLE_GATE_JOURNAL_STATE_COMPLETED",
+    "ImmutableExecutionHandoffContract",
+    "ExecutionHandoffContractError",
+    "EXECUTION_HANDOFF_POLICY_VERSION",
+    "EXECUTION_HANDOFF_SCHEMA_VERSION",
+    "EXECUTION_HANDOFF_STATUS_CONTRACT_BUILT",
     "AuthorizationDecision",
     "AuthorizationError",
     "AuthorizationRequest",
@@ -6655,6 +7509,7 @@ __all__ = [
     "build_trusted_execution_binding",
     "satisfy_one_shot_execution_gate",
     "satisfy_durable_one_shot_execution_gate",
+    "build_immutable_execution_handoff_contract",
     "record_snapshot_hash",
     "request_hash",
 ]

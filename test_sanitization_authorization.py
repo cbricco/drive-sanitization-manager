@@ -1,4 +1,4 @@
-from dataclasses import FrozenInstanceError, fields, replace
+from dataclasses import asdict, FrozenInstanceError, fields, replace
 from datetime import datetime, timedelta, timezone
 import inspect
 import json
@@ -8773,6 +8773,705 @@ class Phase5AuthorizationR2Tests(unittest.TestCase):
                 forbidden,
                 entry_fields,
             )
+
+    def _phase6dd_completed(
+        self,
+        directory,
+        *,
+        request_id="PHASE6DD-REQ",
+    ):
+        (
+            registry,
+            record,
+            request,
+            evidence,
+            binding,
+            at,
+        ) = self._phase6dc_ready(
+            request_id=request_id
+        )
+
+        journal = (
+            auth.DurableExecutionGateConsumptionJournal(
+                Path(directory) / "gate-journal.json"
+            )
+        )
+
+        with patch(
+            "sanitization_authorization._utc_now",
+            return_value=at + timedelta(seconds=2),
+        ):
+            gate = (
+                auth.satisfy_durable_one_shot_execution_gate(
+                    registry=registry,
+                    approval_id=evidence.approval_id,
+                    request=request,
+                    record=record,
+                    journal=journal,
+                )
+            )
+
+        return (
+            registry,
+            record,
+            request,
+            evidence,
+            binding,
+            gate,
+            journal,
+            at,
+        )
+
+    def test_phase6dd_builds_frozen_deterministic_handoff_contract(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                registry,
+                record,
+                request,
+                evidence,
+                _binding,
+                gate,
+                journal,
+                _at,
+            ) = self._phase6dd_completed(
+                directory,
+                request_id="PHASE6DD-DETERMINISTIC",
+            )
+
+            first = (
+                auth.build_immutable_execution_handoff_contract(
+                    registry=registry,
+                    approval_id=evidence.approval_id,
+                    request=request,
+                    record=record,
+                    journal=journal,
+                    gate=gate,
+                )
+            )
+
+            second = (
+                auth.build_immutable_execution_handoff_contract(
+                    registry=registry,
+                    approval_id=evidence.approval_id,
+                    request=request,
+                    record=record,
+                    journal=journal,
+                    gate=gate,
+                )
+            )
+
+            self.assertEqual(first, second)
+
+            self.assertEqual(
+                first.status,
+                auth.EXECUTION_HANDOFF_STATUS_CONTRACT_BUILT,
+            )
+
+            self.assertTrue(
+                auth._immutable_execution_handoff_integrity_valid(
+                    first
+                )
+            )
+
+            with self.assertRaises(FrozenInstanceError):
+                first.status = "other"
+
+    def test_phase6dd_binds_exact_completed_journal_and_gate(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                registry,
+                record,
+                request,
+                evidence,
+                binding,
+                gate,
+                journal,
+                _at,
+            ) = self._phase6dd_completed(
+                directory,
+                request_id="PHASE6DD-JOURNAL-GATE",
+            )
+
+            entry = journal.entry_for_binding(
+                binding.binding_id
+            )
+
+            handoff = (
+                auth.build_immutable_execution_handoff_contract(
+                    registry=registry,
+                    approval_id=evidence.approval_id,
+                    request=request,
+                    record=record,
+                    journal=journal,
+                    gate=gate,
+                )
+            )
+
+            self.assertEqual(
+                entry.state,
+                auth.DURABLE_GATE_JOURNAL_STATE_COMPLETED,
+            )
+
+            self.assertEqual(
+                handoff.gate_id,
+                gate.gate_id,
+            )
+
+            self.assertEqual(
+                handoff.binding_id,
+                binding.binding_id,
+            )
+
+            self.assertEqual(
+                handoff.journal_entry_hash,
+                entry.entry_hash,
+            )
+
+            self.assertEqual(
+                handoff.journal_state,
+                auth.DURABLE_GATE_JOURNAL_STATE_COMPLETED,
+            )
+
+    def test_phase6dd_rejects_reserved_or_missing_journal_evidence(
+        self,
+    ):
+        for mode in (
+            "reserved",
+            "missing",
+        ):
+            with self.subTest(mode=mode):
+                with tempfile.TemporaryDirectory() as directory:
+                    (
+                        registry,
+                        record,
+                        request,
+                        evidence,
+                        binding,
+                        at,
+                    ) = self._phase6dc_ready(
+                        request_id=(
+                            "PHASE6DD-JOURNAL-"
+                            + mode
+                        )
+                    )
+
+                    journal = (
+                        auth.DurableExecutionGateConsumptionJournal(
+                            Path(directory)
+                            / "gate-journal.json"
+                        )
+                    )
+
+                    if mode == "reserved":
+                        with patch(
+                            "sanitization_authorization._utc_now",
+                            return_value=(
+                                at
+                                + timedelta(seconds=2)
+                            ),
+                        ):
+                            journal._reserve(binding)
+
+                    with patch(
+                        "sanitization_authorization._utc_now",
+                        return_value=(
+                            at
+                            + timedelta(seconds=2)
+                        ),
+                    ):
+                        gate = (
+                            auth.satisfy_one_shot_execution_gate(
+                                registry=registry,
+                                approval_id=evidence.approval_id,
+                                request=request,
+                                record=record,
+                            )
+                        )
+
+                    with self.assertRaises(
+                        auth.ExecutionHandoffContractError
+                    ):
+                        auth.build_immutable_execution_handoff_contract(
+                            registry=registry,
+                            approval_id=evidence.approval_id,
+                            request=request,
+                            record=record,
+                            journal=journal,
+                            gate=gate,
+                        )
+
+    def test_phase6dd_rejects_tampered_gate(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                registry,
+                record,
+                request,
+                evidence,
+                _binding,
+                gate,
+                journal,
+                _at,
+            ) = self._phase6dd_completed(
+                directory,
+                request_id="PHASE6DD-TAMPER-GATE",
+            )
+
+            cases = (
+                replace(
+                    gate,
+                    gate_id=(
+                        "xgate_" + ("0" * 64)
+                    ),
+                ),
+                replace(
+                    gate,
+                    target_binding_hash=(
+                        "sha256:" + ("1" * 64)
+                    ),
+                ),
+                replace(
+                    gate,
+                    operation="other",
+                ),
+            )
+
+            for candidate in cases:
+                with self.subTest(
+                    candidate=candidate
+                ):
+                    with self.assertRaises(
+                        auth.ExecutionHandoffContractError
+                    ):
+                        auth.build_immutable_execution_handoff_contract(
+                            registry=registry,
+                            approval_id=evidence.approval_id,
+                            request=request,
+                            record=record,
+                            journal=journal,
+                            gate=candidate,
+                        )
+
+    def test_phase6dd_rejects_changed_request_or_record(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                registry,
+                record,
+                request,
+                evidence,
+                _binding,
+                gate,
+                journal,
+                _at,
+            ) = self._phase6dd_completed(
+                directory,
+                request_id="PHASE6DD-IDENTITY",
+            )
+
+            changed_request = replace(
+                request,
+                operation="sanitize ",
+            )
+
+            changed_record = replace(
+                record,
+                intended_action="changed",
+            )
+
+            for candidate_request, candidate_record in (
+                (changed_request, record),
+                (request, changed_record),
+            ):
+                with self.subTest(
+                    request=candidate_request,
+                    record=candidate_record,
+                ):
+                    with self.assertRaises(
+                        auth.ExecutionHandoffContractError
+                    ):
+                        auth.build_immutable_execution_handoff_contract(
+                            registry=registry,
+                            approval_id=evidence.approval_id,
+                            request=candidate_request,
+                            record=candidate_record,
+                            journal=journal,
+                            gate=gate,
+                        )
+
+    def test_phase6dd_rejects_tampered_registry_target_provenance(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                registry,
+                record,
+                request,
+                evidence,
+                _binding,
+                gate,
+                journal,
+                _at,
+            ) = self._phase6dd_completed(
+                directory,
+                request_id="PHASE6DD-TARGET-TAMPER",
+            )
+
+            revalidation, fresh = (
+                registry._successful_revalidations[
+                    evidence.approval_id
+                ]
+            )
+
+            tampered_target = replace(
+                fresh.target_binding,
+                size_bytes=(
+                    fresh.target_binding.size_bytes
+                    + 1
+                ),
+            )
+
+            tampered_fresh = replace(
+                fresh,
+                target_binding=tampered_target,
+            )
+
+            registry._successful_revalidations[
+                evidence.approval_id
+            ] = (
+                revalidation,
+                tampered_fresh,
+            )
+
+            with self.assertRaises(
+                auth.ExecutionHandoffContractError
+            ):
+                auth.build_immutable_execution_handoff_contract(
+                    registry=registry,
+                    approval_id=evidence.approval_id,
+                    request=request,
+                    record=record,
+                    journal=journal,
+                    gate=gate,
+                )
+
+    def test_phase6dd_carries_exact_target_identity_and_requires_fresh_revalidation(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                registry,
+                record,
+                request,
+                evidence,
+                _binding,
+                gate,
+                journal,
+                _at,
+            ) = self._phase6dd_completed(
+                directory,
+                request_id="PHASE6DD-TARGET",
+            )
+
+            _, fresh = (
+                registry._successful_revalidations[
+                    evidence.approval_id
+                ]
+            )
+
+            target = fresh.target_binding
+
+            handoff = (
+                auth.build_immutable_execution_handoff_contract(
+                    registry=registry,
+                    approval_id=evidence.approval_id,
+                    request=request,
+                    record=record,
+                    journal=journal,
+                    gate=gate,
+                )
+            )
+
+            self.assertEqual(
+                handoff.target_path,
+                target.path,
+            )
+            self.assertEqual(
+                handoff.target_serial,
+                target.serial,
+            )
+            self.assertEqual(
+                handoff.target_wwn,
+                target.wwn,
+            )
+            self.assertEqual(
+                handoff.target_size_bytes,
+                target.size_bytes,
+            )
+            self.assertEqual(
+                handoff.target_model,
+                target.model,
+            )
+            self.assertEqual(
+                handoff.target_transport,
+                target.transport,
+            )
+            self.assertEqual(
+                handoff.target_binding_hash,
+                auth._canonical_hash(
+                    asdict(target)
+                ),
+            )
+            self.assertTrue(
+                handoff.requires_fresh_target_revalidation
+            )
+
+    def test_phase6dd_current_policy_remains_non_executable_and_not_executor_eligible(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                registry,
+                record,
+                request,
+                evidence,
+                _binding,
+                gate,
+                journal,
+                _at,
+            ) = self._phase6dd_completed(
+                directory,
+                request_id="PHASE6DD-NONEXEC",
+            )
+
+            handoff = (
+                auth.build_immutable_execution_handoff_contract(
+                    registry=registry,
+                    approval_id=evidence.approval_id,
+                    request=request,
+                    record=record,
+                    journal=journal,
+                    gate=gate,
+                )
+            )
+
+            self.assertTrue(
+                handoff.policy_only
+            )
+            self.assertFalse(
+                handoff.execution_supported
+            )
+            self.assertFalse(
+                handoff.executor_eligible
+            )
+
+            self.assertNotIn(
+                "authorized",
+                handoff.status,
+            )
+
+            self.assertNotIn(
+                "ready",
+                handoff.status,
+            )
+
+    def test_phase6dd_handoff_integrity_detects_tampering(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                registry,
+                record,
+                request,
+                evidence,
+                _binding,
+                gate,
+                journal,
+                _at,
+            ) = self._phase6dd_completed(
+                directory,
+                request_id="PHASE6DD-INTEGRITY",
+            )
+
+            handoff = (
+                auth.build_immutable_execution_handoff_contract(
+                    registry=registry,
+                    approval_id=evidence.approval_id,
+                    request=request,
+                    record=record,
+                    journal=journal,
+                    gate=gate,
+                )
+            )
+
+            self.assertTrue(
+                auth._immutable_execution_handoff_integrity_valid(
+                    handoff
+                )
+            )
+
+            cases = (
+                replace(
+                    handoff,
+                    handoff_id=(
+                        "xhnd_" + ("0" * 64)
+                    ),
+                ),
+                replace(
+                    handoff,
+                    executor_eligible=True,
+                ),
+                replace(
+                    handoff,
+                    requires_fresh_target_revalidation=False,
+                ),
+                replace(
+                    handoff,
+                    target_size_bytes=(
+                        handoff.target_size_bytes
+                        + 1
+                    ),
+                ),
+                replace(
+                    handoff,
+                    gate_id=(
+                        "xgate_" + ("1" * 64)
+                    ),
+                ),
+            )
+
+            for candidate in cases:
+                with self.subTest(
+                    candidate=candidate
+                ):
+                    self.assertFalse(
+                        auth._immutable_execution_handoff_integrity_valid(
+                            candidate
+                        )
+                    )
+
+    def test_phase6dd_builder_is_read_only_and_non_executing(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                registry,
+                record,
+                request,
+                evidence,
+                _binding,
+                gate,
+                journal,
+                _at,
+            ) = self._phase6dd_completed(
+                directory,
+                request_id="PHASE6DD-SURFACE",
+            )
+
+            journal_bytes_before = (
+                journal.path.read_bytes()
+            )
+
+            consumed_before = set(
+                registry._consumed_execution_bindings
+            )
+
+            with (
+                patch.object(
+                    journal,
+                    "_write_entries_locked",
+                    side_effect=AssertionError(
+                        "handoff builder wrote journal"
+                    ),
+                ),
+                patch(
+                    "sanitization_authorization."
+                    "collect_current_drive_discovery",
+                    side_effect=AssertionError(
+                        "handoff builder ran discovery"
+                    ),
+                ),
+            ):
+                handoff = (
+                    auth.build_immutable_execution_handoff_contract(
+                        registry=registry,
+                        approval_id=evidence.approval_id,
+                        request=request,
+                        record=record,
+                        journal=journal,
+                        gate=gate,
+                    )
+                )
+
+            self.assertTrue(
+                auth._immutable_execution_handoff_integrity_valid(
+                    handoff
+                )
+            )
+
+            self.assertEqual(
+                journal.path.read_bytes(),
+                journal_bytes_before,
+            )
+
+            self.assertEqual(
+                registry._consumed_execution_bindings,
+                consumed_before,
+            )
+
+            field_names = {
+                field.name
+                for field in fields(
+                    auth.ImmutableExecutionHandoffContract
+                )
+            }
+
+            for forbidden in (
+                "command",
+                "executable",
+                "callback",
+                "device_handle",
+                "argv",
+                "arguments",
+                "shell",
+            ):
+                self.assertNotIn(
+                    forbidden,
+                    field_names,
+                )
+
+            source = inspect.getsource(
+                auth.build_immutable_execution_handoff_contract
+            )
+
+            for forbidden_call in (
+                "collect_current_drive_discovery(",
+                "record_human_approval(",
+                "revalidate_approval(",
+                "satisfy_one_shot_execution_gate(",
+                "satisfy_durable_one_shot_execution_gate(",
+                "_reserve(",
+                "_complete(",
+                "_rollback_reservation(",
+                "subprocess.",
+                "os.system(",
+                "Popen(",
+                "shell=True",
+                "exec(",
+                "eval(",
+                "write_text(",
+                "write_bytes(",
+            ):
+                self.assertNotIn(
+                    forbidden_call,
+                    source,
+                )
 
 if __name__ == "__main__":
     unittest.main()
