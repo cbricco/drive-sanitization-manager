@@ -16,7 +16,7 @@ from drive_discovery_adapter import (
     _check_mdadm, _check_resume, _check_special_topology, _check_systemd_units,
 )
 
-LSBLK_BYTES = b'{"blockdevices":[{"name":"syn-root","path":"/dev/syn-root","type":"disk","size":4096,"serial":"ID","children":[{"name":"syn-root1","path":"/dev/syn-root1","type":"part"},{"name":"boot","path":"/dev/boot","type":"part"},{"name":"swap","path":"/dev/swap","type":"part"}]}]}'
+LSBLK_BYTES = b'{"blockdevices":[{"name":"syn-root","path":"/dev/syn-root","type":"disk","maj:min":"8:0","size":4096,"serial":"ID","children":[{"name":"syn-root1","path":"/dev/syn-root1","type":"part"},{"name":"boot","path":"/dev/boot","type":"part"},{"name":"swap","path":"/dev/swap","type":"part"}]}]}'
 FINDMNT_BYTES = b'{"filesystems":[{"target":"/","source":"/dev/syn-root1"}]}'
 REAL_BYTES = b'{"filesystems":[{"target":"/","source":"/dev/syn-root1","fstype":"ext4"}]}'
 FSTAB_BYTES = b'{"filesystems":[]}'
@@ -40,7 +40,7 @@ class DriveDiscoveryAdapterTests(unittest.TestCase):
     def test_commands_and_subprocess_boundary_are_fixed(self):
         self.assertEqual(LSBLK_COMMAND, (
             "lsblk", "--json", "--bytes", "--output",
-            "NAME,KNAME,PATH,TYPE,SIZE,MODEL,SERIAL,TRAN,ROTA,RM,RO,WWN,PKNAME,FSTYPE,MOUNTPOINTS,UUID,PARTUUID,LABEL",
+            "NAME,KNAME,PATH,TYPE,MAJ:MIN,SIZE,MODEL,SERIAL,TRAN,ROTA,RM,RO,WWN,PKNAME,FSTYPE,MOUNTPOINTS,UUID,PARTUUID,LABEL",
         ))
         self.assertEqual(FINDMNT_ROOT_COMMAND, (
             "findmnt", "--json", "--target", "/", "--output", "TARGET,SOURCE",
@@ -71,6 +71,31 @@ class DriveDiscoveryAdapterTests(unittest.TestCase):
             "PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C", "LANG": "C",
         })
         self.assertIn("--list", FINDMNT_REAL_COMMAND)
+
+    def test_fixed_collector_preserves_major_minor_observation(self):
+        with self.successful_mock():
+            snapshot = collect_current_drive_discovery()
+
+        self.assertEqual(
+            snapshot.drives[0].major_minor,
+            "8:0",
+        )
+
+        self.assertIn(
+            "MAJ:MIN",
+            LSBLK_COMMAND[-1].split(","),
+        )
+
+    def test_malformed_major_minor_from_fixed_lsblk_fails_closed(self):
+        document = json.loads(LSBLK_BYTES)
+        document["blockdevices"][0]["maj:min"] = "08:0"
+        malformed = json.dumps(document).encode()
+
+        with (
+            self.successful_mock(lsblk=malformed),
+            self.assertRaises(DiscoveryError),
+        ):
+            collect_current_drive_discovery()
 
     def test_success_preserves_evidence_source_and_marks_system_parent(self):
         with self.successful_mock():

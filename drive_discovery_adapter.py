@@ -12,7 +12,7 @@ from drive_discovery import PhysicalDrive, parse_lsblk_json
 
 LSBLK_COMMAND = (
     "lsblk", "--json", "--bytes", "--output",
-    "NAME,KNAME,PATH,TYPE,SIZE,MODEL,SERIAL,TRAN,ROTA,RM,RO,WWN,PKNAME,FSTYPE,MOUNTPOINTS,UUID,PARTUUID,LABEL",
+    "NAME,KNAME,PATH,TYPE,MAJ:MIN,SIZE,MODEL,SERIAL,TRAN,ROTA,RM,RO,WWN,PKNAME,FSTYPE,MOUNTPOINTS,UUID,PARTUUID,LABEL",
 )
 FINDMNT_ROOT_COMMAND = (
     "findmnt", "--json", "--target", "/", "--output", "TARGET,SOURCE",

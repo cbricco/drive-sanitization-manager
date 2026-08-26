@@ -23,6 +23,7 @@ class BlockDevice:
     kname: Optional[str] = None
     path: Optional[str] = None
     type: Optional[str] = None
+    major_minor: Optional[str] = None
     size: Optional[int] = None
     model: Optional[str] = None
     serial: Optional[str] = None
@@ -92,6 +93,8 @@ class PhysicalDrive:
     @property
     def type(self): return self.device.type
     @property
+    def major_minor(self): return self.device.major_minor
+    @property
     def size(self): return self.device.size
     @property
     def model(self): return self.device.model
@@ -136,6 +139,44 @@ def _optional_string(value: Any, location: str) -> Optional[str]:
         return None
     if not isinstance(value, str):
         raise DiscoveryError(f"{location} must be a string or null")
+    return value
+
+
+def _major_minor(
+    value: Any,
+    location: str,
+) -> Optional[str]:
+    """Validate canonical decimal ``major:minor`` observation text."""
+
+    if value is None:
+        return None
+
+    if not isinstance(value, str):
+        raise DiscoveryError(
+            f"{location} must be a canonical major:minor string or null"
+        )
+
+    components = value.split(":")
+
+    if (
+        len(components) != 2
+        or any(
+            not component
+            or any(
+                character < "0" or character > "9"
+                for character in component
+            )
+            or (
+                len(component) > 1
+                and component.startswith("0")
+            )
+            for component in components
+        )
+    ):
+        raise DiscoveryError(
+            f"{location} must be canonical decimal major:minor text"
+        )
+
     return value
 
 
@@ -194,6 +235,10 @@ def _parse_device(item: Any, location: str) -> BlockDevice:
         kname=_optional_string(item.get("kname"), f"{location}.kname"),
         path=_optional_string(item.get("path"), f"{location}.path"),
         type=device_type,
+        major_minor=_major_minor(
+            item.get("maj:min"),
+            f"{location}.maj:min",
+        ),
         size=_size(item.get("size"), f"{location}.size"),
         model=_optional_string(item.get("model"), f"{location}.model"),
         serial=_optional_string(item.get("serial"), f"{location}.serial"),

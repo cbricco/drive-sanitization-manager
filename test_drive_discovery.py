@@ -138,6 +138,76 @@ class DriveDiscoveryTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual([drive.name for drive in first], ["syn-b", "syn-a"])
 
+    def test_major_minor_is_preserved_as_observational_metadata(self):
+        drive = self.parse([{
+            "name": "syn-major",
+            "path": "/dev/syn-major",
+            "type": "disk",
+            "maj:min": "8:0",
+            "size": 1000,
+            "serial": "SYN-MAJOR-SERIAL",
+            "children": [{
+                "name": "syn-major1",
+                "path": "/dev/syn-major1",
+                "type": "part",
+                "maj:min": "8:1",
+            }],
+        }])[0]
+
+        self.assertEqual(drive.major_minor, "8:0")
+        self.assertEqual(
+            drive.children[0].major_minor,
+            "8:1",
+        )
+
+        missing = self.parse([{
+            "type": "disk",
+            "serial": "SYN-MAJOR-MISSING",
+        }])[0]
+
+        self.assertIsNone(missing.major_minor)
+
+        for forbidden in (
+            "authorized",
+            "approved",
+            "safe_to_wipe",
+            "wipe_allowed",
+        ):
+            self.assertFalse(
+                hasattr(drive, forbidden)
+            )
+
+    def test_major_minor_rejects_noncanonical_or_wrong_type_values(self):
+        malformed = (
+            8,
+            True,
+            "",
+            "8",
+            ":0",
+            "8:",
+            "8:0:1",
+            " 8:0",
+            "8:0 ",
+            "-1:0",
+            "8:-1",
+            "08:0",
+            "8:00",
+            "a:0",
+            "8:b",
+            [],
+            {},
+        )
+
+        for value in malformed:
+            with (
+                self.subTest(value=value),
+                self.assertRaises(DiscoveryError),
+            ):
+                self.parse([{
+                    "type": "disk",
+                    "maj:min": value,
+                }])
+
     def test_bytes_input(self):
         result = parse_lsblk_json(b'{"blockdevices": []}')
         self.assertEqual(result, ())
