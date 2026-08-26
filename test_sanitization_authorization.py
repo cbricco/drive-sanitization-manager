@@ -54,6 +54,7 @@ class Phase5AuthorizationR2Tests(unittest.TestCase):
         self,
         *,
         path="/dev/syn-a",
+        major_minor="8:0",
         size=1_000_000,
         model="Synthetic Model",
         serial="SERIAL-A",
@@ -69,6 +70,7 @@ class Phase5AuthorizationR2Tests(unittest.TestCase):
             "kname": name,
             "path": path,
             "type": "disk",
+            "maj:min": major_minor,
             "size": size,
             "model": model,
             "serial": serial,
@@ -10377,6 +10379,366 @@ class Phase5AuthorizationR2Tests(unittest.TestCase):
                     forbidden_call,
                     source,
                 )
+
+
+    def test_phase6eb2_physical_authorization_binds_kernel_device_number(
+        self,
+    ):
+        decision = self.evaluate()
+
+        self.assertEqual(
+            decision.status,
+            auth.STATUS_PREREQUISITES_MET,
+        )
+        self.assertEqual(
+            decision.reason_codes,
+            (),
+        )
+        self.assertEqual(
+            decision.policy_version,
+            "phase5-auth-v4",
+        )
+
+        binding = decision.target_binding
+
+        self.assertIsNotNone(binding)
+        self.assertEqual(
+            binding.major_minor,
+            "8:0",
+        )
+        self.assertEqual(
+            decision.target_binding_hash,
+            auth._canonical_hash(
+                asdict(binding)
+            ),
+        )
+        self.assertTrue(
+            auth._positive_binding_integrity_valid(
+                binding
+            )
+        )
+
+    def test_phase6eb2_missing_or_malformed_physical_kernel_identity_fails_closed(
+        self,
+    ):
+        missing_snapshot = self.snapshot([
+            self.device(
+                major_minor=None
+            )
+        ])
+
+        missing = self.evaluate(
+            snapshot=missing_snapshot
+        )
+
+        self.assertEqual(
+            missing.status,
+            auth.STATUS_EVALUATION_FAILED,
+        )
+        self.assertIn(
+            "KERNEL_DEVICE_NUMBER_MISSING",
+            missing.reason_codes,
+        )
+        self.assertIsNone(
+            missing.target_binding
+        )
+
+        malformed_drive = PhysicalDrive(
+            device=BlockDevice(
+                name="syn-a",
+                kname="syn-a",
+                path="/dev/syn-a",
+                type="disk",
+                major_minor="08:0",
+                size=1_000_000,
+                model="Synthetic Model",
+                serial="SERIAL-A",
+                transport="usb",
+                read_only=False,
+                wwn="WWN-A",
+            )
+        )
+
+        self.assertIsNone(
+            auth._target_binding(
+                malformed_drive
+            )
+        )
+
+        self.assertFalse(
+            auth._kernel_major_minor_valid(
+                "08:0"
+            )
+        )
+
+    def test_phase6eb2_synthetic_binding_remains_compatible_and_hash_binds_kernel_value(
+        self,
+    ):
+        synthetic = auth.TargetIdentityBinding(
+            path="synthetic://drive-a",
+            serial="SERIAL-A",
+            wwn="WWN-A",
+            size_bytes=1_000_000,
+            model="Synthetic Model",
+            transport="synthetic",
+            read_only=False,
+            mounted=False,
+            protected=False,
+            system_protected=False,
+            review_required=False,
+            ambiguous=False,
+        )
+
+        synthetic_result = (
+            auth.evaluate_sanitization_method_constraints(
+                "phase5-policy-only",
+                synthetic,
+            )
+        )
+
+        self.assertIsNone(
+            synthetic.major_minor
+        )
+        self.assertEqual(
+            synthetic_result.status,
+            auth.METHOD_CONSTRAINT_STATUS_SATISFIED,
+        )
+
+        first = replace(
+            synthetic,
+            major_minor="8:0",
+        )
+        second = replace(
+            synthetic,
+            major_minor="8:16",
+        )
+
+        first_result = (
+            auth.evaluate_sanitization_method_constraints(
+                "phase5-policy-only",
+                first,
+            )
+        )
+        second_result = (
+            auth.evaluate_sanitization_method_constraints(
+                "phase5-policy-only",
+                second,
+            )
+        )
+
+        self.assertNotEqual(
+            first_result.target_binding_hash,
+            second_result.target_binding_hash,
+        )
+
+        malformed = replace(
+            synthetic,
+            major_minor="08:0",
+        )
+
+        malformed_result = (
+            auth.evaluate_sanitization_method_constraints(
+                "phase5-policy-only",
+                malformed,
+            )
+        )
+
+        self.assertEqual(
+            malformed_result.status,
+            auth.METHOD_CONSTRAINT_STATUS_EVALUATION_FAILED,
+        )
+        self.assertEqual(
+            malformed_result.reason_codes,
+            (
+                "METHOD_CONSTRAINT_TARGET_BINDING_INVALID",
+            ),
+        )
+
+    def test_phase6eb2_handoff_carries_and_integrity_binds_kernel_device_number(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                registry,
+                record,
+                request,
+                evidence,
+                _binding,
+                gate,
+                journal,
+                _at,
+            ) = self._phase6dd_completed(
+                directory,
+                request_id="PHASE6EB2-HANDOFF",
+            )
+
+            _, fresh = (
+                registry._successful_revalidations[
+                    evidence.approval_id
+                ]
+            )
+
+            handoff = (
+                auth.build_immutable_execution_handoff_contract(
+                    registry=registry,
+                    approval_id=evidence.approval_id,
+                    request=request,
+                    record=record,
+                    journal=journal,
+                    gate=gate,
+                )
+            )
+
+            self.assertEqual(
+                fresh.target_binding.major_minor,
+                "8:0",
+            )
+            self.assertEqual(
+                handoff.target_major_minor,
+                fresh.target_binding.major_minor,
+            )
+            self.assertEqual(
+                handoff.policy_version,
+                "phase6d-d-immutable-handoff-v2",
+            )
+            self.assertEqual(
+                handoff.schema_version,
+                2,
+            )
+            self.assertTrue(
+                auth._immutable_execution_handoff_integrity_valid(
+                    handoff
+                )
+            )
+
+            self.assertFalse(
+                auth._immutable_execution_handoff_integrity_valid(
+                    replace(
+                        handoff,
+                        target_major_minor="8:16",
+                    )
+                )
+            )
+
+    def test_phase6eb2_fresh_revalidation_carries_kernel_device_number(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                registry,
+                record,
+                request,
+                evidence,
+                _binding,
+                gate,
+                journal,
+                snapshot,
+                at,
+            ) = self._phase6ea_ready(
+                directory,
+                request_id="PHASE6EB2-FRESH",
+            )
+
+            with (
+                patch(
+                    "sanitization_authorization."
+                    "collect_current_drive_discovery",
+                    return_value=snapshot,
+                ),
+                patch(
+                    "sanitization_authorization._utc_now",
+                    return_value=(
+                        at + timedelta(seconds=3)
+                    ),
+                ),
+            ):
+                decision = (
+                    auth.revalidate_physical_target_for_execution_handoff(
+                        registry=registry,
+                        approval_id=evidence.approval_id,
+                        request=request,
+                        record=record,
+                        journal=journal,
+                        gate=gate,
+                    )
+                )
+
+            self.assertEqual(
+                decision.target_major_minor,
+                "8:0",
+            )
+            self.assertEqual(
+                decision.policy_version,
+                "phase6e-a-fresh-physical-target-v2",
+            )
+            self.assertEqual(
+                decision.schema_version,
+                2,
+            )
+            self.assertTrue(
+                auth._fresh_physical_target_revalidation_integrity_valid(
+                    decision
+                )
+            )
+            self.assertFalse(
+                decision.execution_supported
+            )
+            self.assertFalse(
+                decision.executor_eligible
+            )
+            self.assertTrue(
+                decision.requires_separate_executor_authorization
+            )
+
+    def test_phase6eb2_fresh_revalidation_rejects_kernel_device_number_change(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            (
+                registry,
+                record,
+                request,
+                evidence,
+                _binding,
+                gate,
+                journal,
+                _snapshot,
+                at,
+            ) = self._phase6ea_ready(
+                directory,
+                request_id="PHASE6EB2-KERNEL-CHANGE",
+            )
+
+            changed = self.snapshot([
+                self.device(
+                    major_minor="8:16"
+                )
+            ])
+
+            with (
+                patch(
+                    "sanitization_authorization."
+                    "collect_current_drive_discovery",
+                    return_value=changed,
+                ),
+                patch(
+                    "sanitization_authorization._utc_now",
+                    return_value=(
+                        at + timedelta(seconds=3)
+                    ),
+                ),
+            ):
+                with self.assertRaises(
+                    auth.FreshPhysicalTargetRevalidationError
+                ):
+                    auth.revalidate_physical_target_for_execution_handoff(
+                        registry=registry,
+                        approval_id=evidence.approval_id,
+                        request=request,
+                        record=record,
+                        journal=journal,
+                        gate=gate,
+                    )
 
 if __name__ == "__main__":
     unittest.main()

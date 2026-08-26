@@ -37,7 +37,7 @@ from drive_sanitization_manager import (
 )
 
 
-POLICY_VERSION = "phase5-auth-v3"
+POLICY_VERSION = "phase5-auth-v4"
 SCHEMA_VERSION = 1
 
 EVIDENCE_ORIGIN = "phase4-current-collector-v1"
@@ -343,6 +343,7 @@ class TargetIdentityBinding:
     system_protected: bool
     review_required: bool
     ambiguous: bool
+    major_minor: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -390,6 +391,8 @@ _REASON_CLASS = {
     "CAPACITY_INVALID": STATUS_EVALUATION_FAILED,
     "READ_ONLY_STATE_UNKNOWN": STATUS_EVALUATION_FAILED,
     "TARGET_PATH_INVALID": STATUS_EVALUATION_FAILED,
+    "KERNEL_DEVICE_NUMBER_MISSING": STATUS_EVALUATION_FAILED,
+    "KERNEL_DEVICE_NUMBER_INVALID": STATUS_EVALUATION_FAILED,
 
     # Hard policy refusals.
     "BATCH_ID_MISMATCH": STATUS_REFUSED,
@@ -607,6 +610,14 @@ def _sanitization_method_constraint_target_binding_valid(
             ord(character) < 32
             or ord(character) == 127
             for character in target_binding.path
+        )
+    ):
+        return False
+
+    if (
+        target_binding.major_minor is not None
+        and not _kernel_major_minor_valid(
+            target_binding.major_minor
         )
     ):
         return False
@@ -1904,6 +1915,31 @@ def _path_is_valid(value: Any) -> bool:
     )
 
 
+def _kernel_major_minor_valid(value: Any) -> bool:
+    """Validate exact canonical decimal Linux major:minor observation."""
+
+    if not isinstance(value, str):
+        return False
+
+    components = value.split(":")
+
+    return (
+        len(components) == 2
+        and all(
+            component
+            and all(
+                "0" <= character <= "9"
+                for character in component
+            )
+            and (
+                len(component) == 1
+                or not component.startswith("0")
+            )
+            for component in components
+        )
+    )
+
+
 def record_snapshot_hash(record: DriveRecord) -> str:
     """Hash every record field that can affect this Phase 5 policy."""
 
@@ -2202,6 +2238,11 @@ def _target_binding(
     if not _path_is_valid(drive.path):
         return None
 
+    if not _kernel_major_minor_valid(
+        drive.major_minor
+    ):
+        return None
+
     if type(drive.size) is not int or drive.size <= 0:
         return None
 
@@ -2221,6 +2262,7 @@ def _target_binding(
         system_protected=drive.system_protected,
         review_required=drive.review_required,
         ambiguous=drive.ambiguous,
+        major_minor=drive.major_minor,
     )
 
 
@@ -2567,6 +2609,17 @@ def _evaluate_collected_evidence(
                 "STABLE_IDENTIFIER_MISMATCH"
             )
 
+        if target.major_minor is None:
+            reasons.append(
+                "KERNEL_DEVICE_NUMBER_MISSING"
+            )
+        elif not _kernel_major_minor_valid(
+            target.major_minor
+        ):
+            reasons.append(
+                "KERNEL_DEVICE_NUMBER_INVALID"
+            )
+
         if not _path_is_valid(target.path):
             reasons.append("TARGET_PATH_INVALID")
         elif (
@@ -2778,6 +2831,11 @@ def _positive_binding_integrity_valid(
         return False
 
     if not _path_is_valid(binding.path):
+        return False
+
+    if not _kernel_major_minor_valid(
+        binding.major_minor
+    ):
         return False
 
     serial = _candidate_identity(binding.serial)
@@ -4337,7 +4395,7 @@ class ApprovalRegistry:
 
 
 EXECUTION_BINDING_POLICY_VERSION = (
-    "phase6d-a-execution-binding-v1"
+    "phase6d-a-execution-binding-v2"
 )
 EXECUTION_BINDING_SCHEMA_VERSION = 1
 EXECUTION_BINDING_STATUS_SATISFIED = (
@@ -6579,9 +6637,9 @@ def satisfy_durable_one_shot_execution_gate(
     return gate
 
 EXECUTION_HANDOFF_POLICY_VERSION = (
-    "phase6d-d-immutable-handoff-v1"
+    "phase6d-d-immutable-handoff-v2"
 )
-EXECUTION_HANDOFF_SCHEMA_VERSION = 1
+EXECUTION_HANDOFF_SCHEMA_VERSION = 2
 EXECUTION_HANDOFF_STATUS_CONTRACT_BUILT = (
     "execution_handoff_contract_built"
 )
@@ -6638,6 +6696,7 @@ class ImmutableExecutionHandoffContract:
     requires_fresh_target_revalidation: bool
 
     target_path: str
+    target_major_minor: str
     target_serial: Optional[str]
     target_wwn: Optional[str]
     target_size_bytes: int
@@ -6678,6 +6737,7 @@ def _execution_handoff_payload(
     executor_eligible: bool,
     requires_fresh_target_revalidation: bool,
     target_path: str,
+    target_major_minor: str,
     target_serial: Optional[str],
     target_wwn: Optional[str],
     target_size_bytes: int,
@@ -6726,6 +6786,8 @@ def _execution_handoff_payload(
         "requires_fresh_target_revalidation":
             requires_fresh_target_revalidation,
         "target_path": target_path,
+        "target_major_minor":
+            target_major_minor,
         "target_serial": target_serial,
         "target_wwn": target_wwn,
         "target_size_bytes":
@@ -6884,6 +6946,11 @@ def _immutable_execution_handoff_integrity_valid(
         ):
             return False
 
+        if not _kernel_major_minor_valid(
+            handoff.target_major_minor
+        ):
+            return False
+
         for optional_value in (
             handoff.target_serial,
             handoff.target_wwn,
@@ -6975,6 +7042,9 @@ def _immutable_execution_handoff_integrity_valid(
                 handoff.requires_fresh_target_revalidation
             ),
             target_path=handoff.target_path,
+            target_major_minor=(
+                handoff.target_major_minor
+            ),
             target_serial=handoff.target_serial,
             target_wwn=handoff.target_wwn,
             target_size_bytes=(
@@ -7325,6 +7395,7 @@ def build_immutable_execution_handoff_contract(
         executor_eligible=False,
         requires_fresh_target_revalidation=True,
         target_path=target.path,
+        target_major_minor=target.major_minor,
         target_serial=target.serial,
         target_wwn=target.wwn,
         target_size_bytes=target.size_bytes,
@@ -7401,6 +7472,7 @@ def build_immutable_execution_handoff_contract(
         executor_eligible=False,
         requires_fresh_target_revalidation=True,
         target_path=target.path,
+        target_major_minor=target.major_minor,
         target_serial=target.serial,
         target_wwn=target.wwn,
         target_size_bytes=target.size_bytes,
@@ -7428,9 +7500,9 @@ def build_immutable_execution_handoff_contract(
     return handoff
 
 FRESH_TARGET_REVALIDATION_POLICY_VERSION = (
-    "phase6e-a-fresh-physical-target-v1"
+    "phase6e-a-fresh-physical-target-v2"
 )
-FRESH_TARGET_REVALIDATION_SCHEMA_VERSION = 1
+FRESH_TARGET_REVALIDATION_SCHEMA_VERSION = 2
 FRESH_TARGET_REVALIDATION_STATUS_SATISFIED = (
     "target_revalidation_satisfied"
 )
@@ -7480,6 +7552,7 @@ class FreshPhysicalTargetRevalidationDecision:
     constraint_evaluation_hash: str
 
     target_path: str
+    target_major_minor: str
     target_serial: Optional[str]
     target_wwn: Optional[str]
     target_size_bytes: int
@@ -7522,6 +7595,7 @@ def _fresh_target_revalidation_payload(
     fresh_target_binding_hash: str,
     constraint_evaluation_hash: str,
     target_path: str,
+    target_major_minor: str,
     target_serial: Optional[str],
     target_wwn: Optional[str],
     target_size_bytes: int,
@@ -7567,6 +7641,8 @@ def _fresh_target_revalidation_payload(
         "constraint_evaluation_hash":
             constraint_evaluation_hash,
         "target_path": target_path,
+        "target_major_minor":
+            target_major_minor,
         "target_serial": target_serial,
         "target_wwn": target_wwn,
         "target_size_bytes":
@@ -7728,6 +7804,11 @@ def _fresh_physical_target_revalidation_integrity_valid(
         ):
             return False
 
+        if not _kernel_major_minor_valid(
+            decision.target_major_minor
+        ):
+            return False
+
         for optional_value in (
             decision.target_model,
             decision.target_transport,
@@ -7877,6 +7958,9 @@ def _fresh_physical_target_revalidation_integrity_valid(
                 decision.constraint_evaluation_hash
             ),
             target_path=decision.target_path,
+            target_major_minor=(
+                decision.target_major_minor
+            ),
             target_serial=decision.target_serial,
             target_wwn=decision.target_wwn,
             target_size_bytes=(
@@ -8065,6 +8149,8 @@ def revalidate_physical_target_for_execution_handoff(
     if (
         target.path
         != handoff.target_path
+        or target.major_minor
+        != handoff.target_major_minor
         or target.serial
         != handoff.target_serial
         or target.wwn
@@ -8187,6 +8273,7 @@ def revalidate_physical_target_for_execution_handoff(
             constraint_hash
         ),
         target_path=target.path,
+        target_major_minor=target.major_minor,
         target_serial=target.serial,
         target_wwn=target.wwn,
         target_size_bytes=target.size_bytes,
@@ -8268,6 +8355,7 @@ def revalidate_physical_target_for_execution_handoff(
                 constraint_hash
             ),
             target_path=target.path,
+            target_major_minor=target.major_minor,
             target_serial=target.serial,
             target_wwn=target.wwn,
             target_size_bytes=target.size_bytes,
