@@ -13,7 +13,7 @@ grant or perform destructive execution.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from typing import Any
@@ -82,6 +82,29 @@ def _parse_utc(value: Any) -> datetime | None:
         return None
 
     return parsed.astimezone(timezone.utc)
+
+
+def _iso_utc(value: datetime) -> str:
+    return (
+        value.astimezone(timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def _prefixed_hex_id(
+    value: Any,
+    prefix: str,
+) -> bool:
+    return (
+        isinstance(value, str)
+        and value.startswith(prefix)
+        and len(value) == len(prefix) + 64
+        and all(
+            character in "0123456789abcdef"
+            for character in value[len(prefix):]
+        )
+    )
 
 
 def _exact_text(value: Any) -> bool:
@@ -337,6 +360,162 @@ def _continuity_id(
     )
 
 
+def _held_target_safety_continuity_integrity_valid(
+    decision: Any,
+) -> bool:
+    """Check deterministic continuity-object internal consistency only.
+
+    This is not a signature, not a provenance proof, and not executor
+    authorization. A caller able to construct arbitrary objects can also
+    recompute an unkeyed deterministic hash. Future authority consumers
+    must obtain continuity through a separately trusted path.
+    """
+
+    try:
+        if (
+            type(decision)
+            is not HeldTargetSafetyContinuityDecision
+        ):
+            return False
+
+        if (
+            decision.policy_version
+            != HELD_TARGET_SAFETY_CONTINUITY_POLICY_VERSION
+            or type(decision.schema_version)
+            is not int
+            or decision.schema_version
+            != HELD_TARGET_SAFETY_CONTINUITY_SCHEMA_VERSION
+            or decision.status
+            != HELD_TARGET_SAFETY_CONTINUITY_STATUS_SATISFIED
+        ):
+            return False
+
+        if not _prefixed_hex_id(
+            decision.continuity_id,
+            "hsc_",
+        ):
+            return False
+
+        if not _prefixed_hex_id(
+            decision.handoff_id,
+            "xhnd_",
+        ):
+            return False
+
+        if not _prefixed_hex_id(
+            decision.revalidation_id,
+            "ptrv_",
+        ):
+            return False
+
+        if (
+            not _exact_text(
+                decision.target_path
+            )
+            or not _canonical_major_minor(
+                decision.target_major_minor
+            )
+            or not _canonical_sha256(
+                decision.target_binding_hash
+            )
+        ):
+            return False
+
+        if (
+            type(decision.execution_supported)
+            is not bool
+            or decision.execution_supported
+            is not False
+            or type(decision.executor_eligible)
+            is not bool
+            or decision.executor_eligible
+            is not False
+            or type(
+                decision
+                .requires_separate_executor_authorization
+            )
+            is not bool
+            or (
+                decision
+                .requires_separate_executor_authorization
+                is not True
+            )
+        ):
+            return False
+
+        evaluated_at = _parse_utc(
+            decision.evaluated_at_utc
+        )
+        valid_until = _parse_utc(
+            decision.valid_until_utc
+        )
+
+        if (
+            evaluated_at is None
+            or valid_until is None
+        ):
+            return False
+
+        if (
+            _iso_utc(evaluated_at)
+            != decision.evaluated_at_utc
+            or _iso_utc(valid_until)
+            != decision.valid_until_utc
+        ):
+            return False
+
+        lifetime_seconds = getattr(
+            auth,
+            "PREREQUISITE_LIFETIME_SECONDS",
+            None,
+        )
+
+        if (
+            type(lifetime_seconds)
+            is not int
+            or lifetime_seconds <= 0
+        ):
+            return False
+
+        if (
+            evaluated_at > valid_until
+            or valid_until
+            != evaluated_at
+            + timedelta(
+                seconds=lifetime_seconds
+            )
+        ):
+            return False
+
+        payload = _continuity_payload(
+            handoff_id=decision.handoff_id,
+            revalidation_id=(
+                decision.revalidation_id
+            ),
+            target_path=decision.target_path,
+            target_major_minor=(
+                decision.target_major_minor
+            ),
+            target_binding_hash=(
+                decision.target_binding_hash
+            ),
+            evaluated_at_utc=(
+                decision.evaluated_at_utc
+            ),
+            valid_until_utc=(
+                decision.valid_until_utc
+            ),
+        )
+
+        return (
+            decision.continuity_id
+            == _continuity_id(payload)
+        )
+
+    except Exception:
+        return False
+
+
 def revalidate_held_target_safety_continuity(
     *,
     held_reference: Any,
@@ -435,7 +614,7 @@ def revalidate_held_target_safety_continuity(
             "held target reference closed before continuity decision"
         )
 
-    return HeldTargetSafetyContinuityDecision(
+    decision = HeldTargetSafetyContinuityDecision(
         continuity_id=_continuity_id(
             payload
         ),
@@ -471,6 +650,17 @@ def revalidate_held_target_safety_continuity(
         executor_eligible=False,
         requires_separate_executor_authorization=True,
     )
+
+    if not (
+        _held_target_safety_continuity_integrity_valid(
+            decision
+        )
+    ):
+        raise HeldTargetSafetyContinuityError(
+            "constructed held-target safety continuity decision failed integrity validation"
+        )
+
+    return decision
 
 
 __all__ = [

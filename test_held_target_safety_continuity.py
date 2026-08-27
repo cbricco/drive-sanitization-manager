@@ -1,4 +1,4 @@
-from dataclasses import FrozenInstanceError, fields
+from dataclasses import FrozenInstanceError, fields, replace
 from datetime import datetime, timezone
 from types import SimpleNamespace
 import unittest
@@ -55,7 +55,7 @@ class _FreshDecision:
         target_major_minor="8:0",
         binding_hash="sha256:" + ("b" * 64),
         evaluated_at_utc="2026-08-26T14:59:55Z",
-        valid_until_utc="2026-08-26T15:00:25Z",
+        valid_until_utc="2026-08-26T15:04:55Z",
     ):
         if status is None:
             status = (
@@ -780,6 +780,342 @@ class HeldTargetSafetyContinuityTests(
             [
                 "revalidate_held_target_safety_continuity"
             ],
+        )
+
+
+    def genuine_continuity_decision(
+        self,
+    ):
+        patches = self.environment()
+
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+        ):
+            return self.run_continuity(
+                self.held()
+            )
+
+    def rehash_continuity_decision(
+        self,
+        decision,
+    ):
+        payload = continuity._continuity_payload(
+            handoff_id=decision.handoff_id,
+            revalidation_id=(
+                decision.revalidation_id
+            ),
+            target_path=decision.target_path,
+            target_major_minor=(
+                decision.target_major_minor
+            ),
+            target_binding_hash=(
+                decision.target_binding_hash
+            ),
+            evaluated_at_utc=(
+                decision.evaluated_at_utc
+            ),
+            valid_until_utc=(
+                decision.valid_until_utc
+            ),
+        )
+
+        return replace(
+            decision,
+            continuity_id=(
+                continuity._continuity_id(
+                    payload
+                )
+            ),
+        )
+
+    def test_genuine_decision_passes_internal_integrity_validator(
+        self,
+    ):
+        decision = (
+            self.genuine_continuity_decision()
+        )
+
+        self.assertTrue(
+            continuity
+            ._held_target_safety_continuity_integrity_valid(
+                decision
+            )
+        )
+
+        self.assertNotIn(
+            "_held_target_safety_continuity_integrity_valid",
+            continuity.__all__,
+        )
+
+        validator_doc = (
+            continuity
+            ._held_target_safety_continuity_integrity_valid
+            .__doc__
+            .lower()
+        )
+
+        self.assertIn(
+            "not a signature",
+            validator_doc,
+        )
+        self.assertIn(
+            "not a provenance proof",
+            validator_doc,
+        )
+        self.assertIn(
+            "not executor",
+            validator_doc,
+        )
+
+    def test_integrity_validator_rejects_wrong_type_and_malformed_identity(
+        self,
+    ):
+        decision = (
+            self.genuine_continuity_decision()
+        )
+
+        self.assertFalse(
+            continuity
+            ._held_target_safety_continuity_integrity_valid(
+                SimpleNamespace(
+                    **decision.__dict__
+                )
+            )
+        )
+
+        cases = (
+            {
+                "continuity_id":
+                    "hsc_not-a-digest"
+            },
+            {
+                "handoff_id":
+                    "xhnd_not-a-digest"
+            },
+            {
+                "revalidation_id":
+                    "ptrv_not-a-digest"
+            },
+            {
+                "target_path":
+                    " /dev/syn-a"
+            },
+            {
+                "target_major_minor":
+                    "08:0"
+            },
+            {
+                "target_binding_hash":
+                    "sha256:not-a-digest"
+            },
+        )
+
+        for changes in cases:
+            with self.subTest(
+                changes=changes
+            ):
+                self.assertFalse(
+                    continuity
+                    ._held_target_safety_continuity_integrity_valid(
+                        replace(
+                            decision,
+                            **changes,
+                        )
+                    )
+                )
+
+    def test_integrity_validator_rejects_policy_schema_status_and_authority_tampering(
+        self,
+    ):
+        decision = (
+            self.genuine_continuity_decision()
+        )
+
+        cases = (
+            {
+                "policy_version":
+                    "phase6e-b3d-a-held-safety-continuity-v2"
+            },
+            {
+                "schema_version": 2
+            },
+            {
+                "schema_version": True
+            },
+            {
+                "status":
+                    "held_target_safety_continuity_not_satisfied"
+            },
+            {
+                "execution_supported":
+                    True
+            },
+            {
+                "execution_supported":
+                    0
+            },
+            {
+                "executor_eligible":
+                    True
+            },
+            {
+                "requires_separate_executor_authorization":
+                    False
+            },
+        )
+
+        for changes in cases:
+            with self.subTest(
+                changes=changes
+            ):
+                self.assertFalse(
+                    continuity
+                    ._held_target_safety_continuity_integrity_valid(
+                        replace(
+                            decision,
+                            **changes,
+                        )
+                    )
+                )
+
+    def test_integrity_validator_rejects_tampering_with_original_id(
+        self,
+    ):
+        decision = (
+            self.genuine_continuity_decision()
+        )
+
+        cases = (
+            {
+                "handoff_id":
+                    "xhnd_" + ("d" * 64)
+            },
+            {
+                "revalidation_id":
+                    "ptrv_" + ("e" * 64)
+            },
+            {
+                "target_path":
+                    "/dev/syn-b"
+            },
+            {
+                "target_major_minor":
+                    "8:16"
+            },
+            {
+                "target_binding_hash":
+                    "sha256:" + ("f" * 64)
+            },
+        )
+
+        for changes in cases:
+            with self.subTest(
+                changes=changes
+            ):
+                changed = replace(
+                    decision,
+                    **changes,
+                )
+
+                self.assertFalse(
+                    continuity
+                    ._held_target_safety_continuity_integrity_valid(
+                        changed
+                    )
+                )
+
+    def test_integrity_validator_rejects_rehashed_lifetime_and_time_abuse(
+        self,
+    ):
+        decision = (
+            self.genuine_continuity_decision()
+        )
+
+        malicious_cases = (
+            replace(
+                decision,
+                valid_until_utc=(
+                    "2026-08-26T15:04:56Z"
+                ),
+            ),
+            replace(
+                decision,
+                evaluated_at_utc=(
+                    "2026-08-26T14:59:55+00:00"
+                ),
+            ),
+            replace(
+                decision,
+                evaluated_at_utc=(
+                    "2026-08-26T15:05:00Z"
+                ),
+            ),
+            replace(
+                decision,
+                evaluated_at_utc=(
+                    "not-a-time"
+                ),
+            ),
+            replace(
+                decision,
+                valid_until_utc=(
+                    "not-a-time"
+                ),
+            ),
+        )
+
+        for changed in malicious_cases:
+            with self.subTest(
+                changed=changed
+            ):
+                rehashed = (
+                    self
+                    .rehash_continuity_decision(
+                        changed
+                    )
+                )
+
+                self.assertFalse(
+                    continuity
+                    ._held_target_safety_continuity_integrity_valid(
+                        rehashed
+                    )
+                )
+
+    def test_builder_refuses_to_return_failed_integrity_decision(
+        self,
+    ):
+        reference = self.held()
+        patches = self.environment()
+
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            patches[3],
+            patches[4],
+            patch.object(
+                continuity,
+                "_held_target_safety_continuity_integrity_valid",
+                return_value=False,
+            ) as integrity,
+        ):
+            with self.assertRaisesRegex(
+                continuity
+                .HeldTargetSafetyContinuityError,
+                "constructed held-target safety continuity decision failed integrity validation",
+            ):
+                self.run_continuity(
+                    reference
+                )
+
+        integrity.assert_called_once()
+        self.assertFalse(
+            reference.closed
         )
 
 
