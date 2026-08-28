@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import pickle
 import stat
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -68,6 +69,49 @@ class _Continuity:
         )
         self.integrity = integrity
 
+
+class _FakeHeldReferenceScope:
+    def __init__(self, reference):
+        self.reference = reference
+        self.used = False
+        self.entered = False
+        self.exit_count = 0
+
+    def __enter__(self):
+        if self.used:
+            raise RuntimeError(
+                "synthetic B3A scope reused"
+            )
+        self.used = True
+        self.entered = True
+        return self
+
+    def __exit__(
+        self,
+        exc_type,
+        exc,
+        traceback,
+    ):
+        if not self.entered:
+            raise RuntimeError(
+                "synthetic B3A scope exit without entry"
+            )
+        self.entered = False
+        self.exit_count += 1
+        return False
+
+    @property
+    def identity(self):
+        if not self.entered:
+            raise RuntimeError(
+                "synthetic B3A scope is not active"
+            )
+        return (
+            self.reference.handoff_id,
+            self.reference.target_path,
+            self.reference.target_major_minor,
+            self.reference.target_binding_hash,
+        )
 
 class KernelWriteClaimAcquisitionTests(unittest.TestCase):
     FD = 61
@@ -143,6 +187,15 @@ class KernelWriteClaimAcquisitionTests(unittest.TestCase):
                 _HeldReference,
             )
         )
+        b3a_scope_factory = stack.enter_context(
+            patch.object(
+                claim.held_ref,
+                "_locked_kernel_target_reference_scope",
+                side_effect=lambda reference: _FakeHeldReferenceScope(
+                    reference
+                ),
+            )
+        )
         stack.enter_context(
             patch.object(
                 claim.continuity,
@@ -208,6 +261,7 @@ class KernelWriteClaimAcquisitionTests(unittest.TestCase):
             flags=flags,
             inheritable=inheritable_mock,
             close=close,
+            b3a_scope_factory=b3a_scope_factory,
         )
 
     def test_success_uses_exact_trusted_path_flags_and_is_non_authorizing(self):
@@ -726,3 +780,272 @@ class KernelWriteClaimAcquisitionTests(unittest.TestCase):
             Mock,
         )
         self.open_mock.assert_not_called()
+
+    def test_locked_validation_scope_is_opaque_and_revalidates_descriptor(self):
+        reference = self.held()
+        mocks = self.environment(reference=reference)
+
+        with mocks.stack:
+            held_claim = self.run_claim(reference)
+            mocks.fstat.reset_mock()
+            mocks.flags.reset_mock()
+            mocks.inheritable.reset_mock()
+
+            with claim._locked_write_claim_validation_scope(
+                held_claim
+            ) as scope:
+                self.assertEqual(
+                    scope.identity,
+                    (
+                        held_claim.handoff_id,
+                        held_claim.target_path,
+                        held_claim.target_major_minor,
+                        held_claim.target_binding_hash,
+                    ),
+                )
+                self.assertIs(
+                    scope.held_reference,
+                    reference,
+                )
+                self.assertEqual(
+                    scope.claim_pre_continuity_id,
+                    held_claim.pre_continuity_id,
+                )
+                self.assertEqual(
+                    scope.claim_post_continuity_id,
+                    held_claim.post_continuity_id,
+                )
+
+                for name in (
+                    "fd",
+                    "fileno",
+                    "read",
+                    "write",
+                    "seek",
+                    "callback",
+                    "command",
+                    "subprocess",
+                    "executor",
+                    "execute",
+                ):
+                    self.assertFalse(
+                        hasattr(scope, name),
+                        name,
+                    )
+
+                self.assertEqual(
+                    scope.revalidate_descriptor(),
+                    reference.target_major_minor,
+                )
+
+            mocks.fstat.assert_called_once_with(self.FD)
+            mocks.flags.assert_called_once_with(
+                self.FD,
+                claim.fcntl.F_GETFL,
+            )
+            mocks.inheritable.assert_called_once_with(self.FD)
+
+            held_claim.close()
+
+    def test_locked_validation_scope_blocks_close_until_scope_exit(self):
+        reference = self.held()
+        mocks = self.environment(reference=reference)
+
+        with mocks.stack:
+            held_claim = self.run_claim(reference)
+            close_started = threading.Event()
+            close_finished = threading.Event()
+
+            def closer():
+                close_started.set()
+                held_claim.close()
+                close_finished.set()
+
+            with claim._locked_write_claim_validation_scope(
+                held_claim
+            ):
+                thread = threading.Thread(
+                    target=closer
+                )
+                thread.start()
+                self.assertTrue(
+                    close_started.wait(1.0)
+                )
+                self.assertFalse(
+                    close_finished.wait(0.05)
+                )
+                self.assertFalse(held_claim.closed)
+
+            self.assertTrue(
+                close_finished.wait(1.0)
+            )
+            thread.join()
+            self.assertTrue(held_claim.closed)
+            mocks.close.assert_called_once_with(self.FD)
+
+    def test_locked_validation_scope_refuses_closed_claim(self):
+        reference = self.held()
+        mocks = self.environment(reference=reference)
+
+        with mocks.stack:
+            held_claim = self.run_claim(reference)
+            held_claim.close()
+
+            with self.assertRaises(
+                claim.KernelWriteClaimAcquisitionError
+            ):
+                with claim._locked_write_claim_validation_scope(
+                    held_claim
+                ):
+                    self.fail(
+                        "closed claim unexpectedly entered validation scope"
+                    )
+
+    def test_locked_validation_scope_is_private_and_public_api_unchanged(self):
+        self.assertNotIn(
+            "_locked_write_claim_validation_scope",
+            claim.__all__,
+        )
+        self.assertNotIn(
+            "_LockedWriteClaimValidationScope",
+            claim.__all__,
+        )
+        self.assertEqual(
+            claim.__all__,
+            [
+                "KERNEL_WRITE_CLAIM_ACQUISITION_POLICY_VERSION",
+                "HeldKernelWriteClaim",
+                "KernelWriteClaimAcquisitionError",
+                "acquire_kernel_write_claim",
+            ],
+        )
+
+    def test_r3_scope_source_enforces_b3ef_then_b3a_lock_order(self):
+        source = Path(claim.__file__).read_text(
+            encoding="utf-8"
+        )
+        tree = ast.parse(source)
+
+        scope_class = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "_LockedWriteClaimValidationScope"
+        )
+        enter = next(
+            node
+            for node in scope_class.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "__enter__"
+        )
+        exit_method = next(
+            node
+            for node in scope_class.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "__exit__"
+        )
+
+        enter_text = ast.get_source_segment(
+            source,
+            enter,
+        )
+        exit_text = ast.get_source_segment(
+            source,
+            exit_method,
+        )
+
+        self.assertLess(
+            enter_text.index(
+                "_claim._lifecycle_lock.acquire()"
+            ),
+            enter_text.index(
+                "_locked_kernel_target_reference_scope"
+            ),
+        )
+        self.assertLess(
+            enter_text.index(
+                "_locked_kernel_target_reference_scope"
+            ),
+            enter_text.index(
+                "b3a_scope.__enter__()"
+            ),
+        )
+        self.assertLess(
+            exit_text.index(
+                "b3a_scope.__exit__"
+            ),
+            exit_text.index(
+                "_claim._lifecycle_lock.release()"
+            ),
+        )
+
+    def test_r3_validation_scope_reentry_and_reuse_refuse(self):
+        reference = self.held()
+        mocks = self.environment(reference=reference)
+
+        with mocks.stack:
+            held_claim = self.run_claim(reference)
+            scope = claim._locked_write_claim_validation_scope(
+                held_claim
+            )
+
+            with scope:
+                with self.assertRaisesRegex(
+                    claim.KernelWriteClaimAcquisitionError,
+                    "single-use",
+                ):
+                    scope.__enter__()
+
+            with self.assertRaisesRegex(
+                claim.KernelWriteClaimAcquisitionError,
+                "single-use",
+            ):
+                scope.__enter__()
+
+            held_claim.close()
+
+    def test_r3_validation_scope_failure_releases_b3a_and_b3ef_locks(self):
+        reference = self.held()
+        mocks = self.environment(reference=reference)
+
+        class FailingIdentityScope(_FakeHeldReferenceScope):
+            @property
+            def identity(self):
+                if not self.entered:
+                    raise RuntimeError(
+                        "synthetic B3A scope is not active"
+                    )
+                raise RuntimeError(
+                    "synthetic pinned identity failure"
+                )
+
+        created = []
+
+        def make_scope(value):
+            scope = FailingIdentityScope(value)
+            created.append(scope)
+            return scope
+
+        with mocks.stack:
+            held_claim = self.run_claim(reference)
+
+            with patch.object(
+                claim.held_ref,
+                "_locked_kernel_target_reference_scope",
+                side_effect=make_scope,
+            ):
+                scope = claim._locked_write_claim_validation_scope(
+                    held_claim
+                )
+                with self.assertRaises(
+                    claim.KernelWriteClaimAcquisitionError
+                ):
+                    scope.__enter__()
+
+            self.assertEqual(len(created), 1)
+            self.assertFalse(created[0].entered)
+            self.assertEqual(created[0].exit_count, 1)
+
+            # If the B3E-F RLock leaked, this close would deadlock.
+            held_claim.close()
+            self.assertTrue(held_claim.closed)

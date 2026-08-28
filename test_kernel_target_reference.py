@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import os
 import pickle
 import stat
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -504,6 +505,142 @@ class HeldKernelTargetReferenceTests(unittest.TestCase):
             mocks.close.assert_called_once_with(
                 self.FD
             )
+
+    def _r3_lifecycle_reference(self):
+        decision = SimpleNamespace(
+            target_path="/dev/synthetic-r3-b3a",
+            revalidation_id="r3-revalidation",
+            handoff_id="xhnd_" + ("a" * 64),
+            fresh_target_binding_hash="sha256:" + ("b" * 64),
+        )
+        return ref.HeldKernelTargetReference(
+            ref._CONSTRUCTION_TOKEN,
+            fd=73,
+            decision=decision,
+            observed_major_minor="8:0",
+        )
+
+    def test_r3_private_lifecycle_scope_is_opaque_and_public_api_unchanged(self):
+        reference = self._r3_lifecycle_reference()
+
+        with patch.object(ref.os, "close") as close_mock:
+            scope = ref._locked_kernel_target_reference_scope(
+                reference
+            )
+
+            with scope as active:
+                self.assertEqual(
+                    active.identity,
+                    (
+                        reference.handoff_id,
+                        reference.target_path,
+                        reference.target_major_minor,
+                        reference.target_binding_hash,
+                    ),
+                )
+
+                for name in (
+                    "fd",
+                    "fileno",
+                    "read",
+                    "write",
+                    "seek",
+                    "callback",
+                    "command",
+                    "subprocess",
+                    "executor",
+                    "execute",
+                ):
+                    self.assertFalse(
+                        hasattr(active, name),
+                        name,
+                    )
+
+            self.assertNotIn(
+                "_locked_kernel_target_reference_scope",
+                ref.__all__,
+            )
+            self.assertNotIn(
+                "_LockedKernelTargetReferenceScope",
+                ref.__all__,
+            )
+            reference.close()
+            close_mock.assert_called_once_with(73)
+
+    def test_r3_lifecycle_scope_blocks_close_until_exit(self):
+        reference = self._r3_lifecycle_reference()
+        close_started = threading.Event()
+        close_finished = threading.Event()
+
+        with patch.object(ref.os, "close") as close_mock:
+            def closer():
+                close_started.set()
+                reference.close()
+                close_finished.set()
+
+            with ref._locked_kernel_target_reference_scope(
+                reference
+            ):
+                thread = threading.Thread(
+                    target=closer
+                )
+                thread.start()
+                self.assertTrue(
+                    close_started.wait(1.0)
+                )
+                self.assertFalse(
+                    close_finished.wait(0.05)
+                )
+                self.assertFalse(reference.closed)
+
+            self.assertTrue(
+                close_finished.wait(1.0)
+            )
+            thread.join()
+            self.assertTrue(reference.closed)
+            close_mock.assert_called_once_with(73)
+
+    def test_r3_lifecycle_scope_reentry_and_reuse_refuse(self):
+        reference = self._r3_lifecycle_reference()
+
+        with patch.object(ref.os, "close"):
+            scope = ref._locked_kernel_target_reference_scope(
+                reference
+            )
+
+            with scope:
+                with self.assertRaisesRegex(
+                    ref.HeldKernelTargetReferenceError,
+                    "single-use",
+                ):
+                    scope.__enter__()
+
+            with self.assertRaisesRegex(
+                ref.HeldKernelTargetReferenceError,
+                "single-use",
+            ):
+                scope.__enter__()
+
+            reference.close()
+
+    def test_r3_lifecycle_scope_exception_releases_close_path(self):
+        reference = self._r3_lifecycle_reference()
+
+        with patch.object(ref.os, "close") as close_mock:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "synthetic lifecycle failure",
+            ):
+                with ref._locked_kernel_target_reference_scope(
+                    reference
+                ):
+                    raise RuntimeError(
+                        "synthetic lifecycle failure"
+                    )
+
+            reference.close()
+            self.assertTrue(reference.closed)
+            close_mock.assert_called_once_with(73)
 
 
 if __name__ == "__main__":

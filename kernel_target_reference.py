@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 import fcntl
 import os
 import stat
+import threading
 from typing import Any
 
 import sanitization_authorization as auth
@@ -182,6 +183,7 @@ class HeldKernelTargetReference:
         "_revalidation_id",
         "_handoff_id",
         "_target_binding_hash",
+        "_lifecycle_lock",
     )
 
     def __init__(
@@ -211,10 +213,12 @@ class HeldKernelTargetReference:
         self._target_binding_hash = (
             decision.fresh_target_binding_hash
         )
+        self._lifecycle_lock = threading.RLock()
 
     @property
     def closed(self) -> bool:
-        return self._closed
+        with self._lifecycle_lock:
+            return self._closed
 
     @property
     def target_path(self) -> str:
@@ -237,30 +241,31 @@ class HeldKernelTargetReference:
         return self._target_binding_hash
 
     def close(self) -> None:
-        if self._closed:
-            return
+        with self._lifecycle_lock:
+            if self._closed:
+                return
 
-        fd = self._fd
+            fd = self._fd
 
-        # Mark the capability unusable before close().  Retrying a descriptor
-        # integer after a reported close error could act on a later-reused FD.
-        self._fd = -1
-        self._closed = True
+            # Invalidate before close. A reported close failure must never
+            # cause this integer to be retried after descriptor recycling.
+            self._fd = -1
+            self._closed = True
 
-        try:
-            os.close(fd)
-        except OSError as exc:
-            raise HeldKernelTargetReferenceError(
-                "held kernel target descriptor close failed; "
-                "the reference must not be reused"
-            ) from exc
+            try:
+                os.close(fd)
+            except OSError as exc:
+                raise HeldKernelTargetReferenceError(
+                    "held descriptor close failed; "
+                    "the reference must not be reused"
+                ) from exc
 
     def __enter__(
         self,
     ) -> "HeldKernelTargetReference":
-        if self._closed:
+        if self.closed:
             raise HeldKernelTargetReferenceError(
-                "held kernel target reference is already closed"
+                "held target reference is closed"
             )
 
         return self
@@ -311,6 +316,125 @@ class HeldKernelTargetReference:
             "held kernel target references cannot be serialized"
         )
 
+
+class _LockedKernelTargetReferenceScope:
+    """Private single-use lifecycle pin; never exposes the owned descriptor."""
+
+    __slots__ = (
+        "_reference",
+        "_entry_lock",
+        "_used",
+        "_entered",
+    )
+
+    def __init__(
+        self,
+        reference: HeldKernelTargetReference,
+    ) -> None:
+        if type(reference) is not HeldKernelTargetReference:
+            raise HeldKernelTargetReferenceError(
+                "lifecycle scope requires an exact B3A held reference"
+            )
+
+        self._reference = reference
+        self._entry_lock = threading.Lock()
+        self._used = False
+        self._entered = False
+
+    def _require_entered(self) -> None:
+        if self._entered is not True:
+            raise HeldKernelTargetReferenceError(
+                "B3A lifecycle scope is not active"
+            )
+
+    def __enter__(
+        self,
+    ) -> "_LockedKernelTargetReferenceScope":
+        with self._entry_lock:
+            if self._used:
+                raise HeldKernelTargetReferenceError(
+                    "B3A lifecycle scope is single-use"
+                )
+            self._used = True
+
+        self._reference._lifecycle_lock.acquire()
+
+        try:
+            if (
+                self._reference._closed is not False
+                or type(self._reference._fd) is not int
+                or self._reference._fd < 0
+            ):
+                raise HeldKernelTargetReferenceError(
+                    "B3A held reference is not live"
+                )
+
+            identity = (
+                self._reference._handoff_id,
+                self._reference._target_path,
+                self._reference._target_major_minor,
+                self._reference._target_binding_hash,
+            )
+
+            if not all(
+                isinstance(value, str) and bool(value)
+                for value in identity
+            ):
+                raise HeldKernelTargetReferenceError(
+                    "B3A held-reference identity is malformed"
+                )
+
+            self._entered = True
+            return self
+
+        except BaseException:
+            self._reference._lifecycle_lock.release()
+            raise
+
+    def __exit__(
+        self,
+        exc_type: Any,
+        exc: BaseException | None,
+        traceback: Any,
+    ) -> bool:
+        if self._entered is not True:
+            raise HeldKernelTargetReferenceError(
+                "B3A lifecycle scope exit without active entry"
+            )
+
+        self._entered = False
+        self._reference._lifecycle_lock.release()
+        return False
+
+    @property
+    def identity(
+        self,
+    ) -> tuple[str, str, str, str]:
+        self._require_entered()
+
+        if (
+            self._reference._closed is not False
+            or type(self._reference._fd) is not int
+            or self._reference._fd < 0
+        ):
+            raise HeldKernelTargetReferenceError(
+                "B3A held reference changed while pinned"
+            )
+
+        return (
+            self._reference._handoff_id,
+            self._reference._target_path,
+            self._reference._target_major_minor,
+            self._reference._target_binding_hash,
+        )
+
+
+def _locked_kernel_target_reference_scope(
+    reference: Any,
+) -> _LockedKernelTargetReferenceScope:
+    """Return one private single-use B3A lifecycle pin."""
+
+    return _LockedKernelTargetReferenceScope(reference)
 
 def adopt_held_kernel_target_reference(
     fd: Any,

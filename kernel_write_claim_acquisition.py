@@ -21,6 +21,7 @@ import errno
 import fcntl
 import os
 import stat
+import threading
 from typing import Any
 
 import held_target_safety_continuity as continuity
@@ -381,6 +382,7 @@ class HeldKernelWriteClaim:
         "_target_binding_hash",
         "_pre_continuity_id",
         "_post_continuity_id",
+        "_lifecycle_lock",
     )
 
     def __init__(
@@ -411,20 +413,23 @@ class HeldKernelWriteClaim:
         self._held_reference = held_reference
         self._pre_continuity_id = pre_continuity_id
         self._post_continuity_id = post_continuity_id
+        self._lifecycle_lock = threading.RLock()
 
     @property
     def closed(self) -> bool:
-        return self._closed
+        with self._lifecycle_lock:
+            return self._closed
 
     @property
     def live(self) -> bool:
-        if self._closed:
-            return False
+        with self._lifecycle_lock:
+            if self._closed:
+                return False
 
-        try:
-            return self._held_reference.closed is False
-        except Exception:
-            return False
+            try:
+                return self._held_reference.closed is False
+            except Exception:
+                return False
 
     @property
     def handoff_id(self) -> str:
@@ -475,23 +480,24 @@ class HeldKernelWriteClaim:
         return True
 
     def close(self) -> None:
-        if self._closed:
-            return
+        with self._lifecycle_lock:
+            if self._closed:
+                return
 
-        fd = self._fd
+            fd = self._fd
 
-        # Invalidate first. A reported close failure must never cause this
-        # integer to be retried after the kernel could have recycled it.
-        self._fd = -1
-        self._closed = True
+            # Invalidate first. A reported close failure must never cause
+            # this integer to be retried after kernel descriptor reuse.
+            self._fd = -1
+            self._closed = True
 
-        try:
-            os.close(fd)
-        except OSError as exc:
-            raise KernelWriteClaimAcquisitionError(
-                "write-claim descriptor close failed; "
-                "the claim must not be reused"
-            ) from exc
+            try:
+                os.close(fd)
+            except OSError as exc:
+                raise KernelWriteClaimAcquisitionError(
+                    "write-claim descriptor close failed; "
+                    "the claim must not be reused"
+                ) from exc
 
     def __enter__(self) -> "HeldKernelWriteClaim":
         if not self.live:
@@ -546,6 +552,285 @@ class HeldKernelWriteClaim:
         raise KernelWriteClaimAcquisitionError(
             "write claims cannot be serialized"
         )
+
+
+
+class _LockedWriteClaimValidationScope:
+    """Private single-use B3E-F validation scope with a transitive B3A pin."""
+
+    __slots__ = (
+        "_claim",
+        "_entry_lock",
+        "_used",
+        "_entered",
+        "_b3a_scope",
+    )
+
+    def __init__(
+        self,
+        write_claim: HeldKernelWriteClaim,
+    ) -> None:
+        if type(write_claim) is not HeldKernelWriteClaim:
+            raise KernelWriteClaimAcquisitionError(
+                "validation scope requires an exact B3E-F write claim"
+            )
+
+        self._claim = write_claim
+        self._entry_lock = threading.Lock()
+        self._used = False
+        self._entered = False
+        self._b3a_scope = None
+
+    def _require_entered(self) -> None:
+        if self._entered is not True:
+            raise KernelWriteClaimAcquisitionError(
+                "write-claim validation scope is not active"
+            )
+
+    def _state_locked(
+        self,
+    ) -> tuple[
+        held_ref.HeldKernelTargetReference,
+        tuple[str, str, str, str],
+        str,
+        str,
+        int,
+    ]:
+        self._require_entered()
+
+        write_claim = self._claim
+
+        if (
+            write_claim._closed is not False
+            or type(write_claim._fd) is not int
+            or write_claim._fd < 0
+        ):
+            raise KernelWriteClaimAcquisitionError(
+                "write claim is not live inside validation scope"
+            )
+
+        held_reference = write_claim._held_reference
+        b3a_scope = self._b3a_scope
+
+        if (
+            type(held_reference)
+            is not held_ref.HeldKernelTargetReference
+            or b3a_scope is None
+        ):
+            raise KernelWriteClaimAcquisitionError(
+                "write claim no longer owns the exact pinned B3A reference"
+            )
+
+        identity = (
+            write_claim._handoff_id,
+            write_claim._target_path,
+            write_claim._target_major_minor,
+            write_claim._target_binding_hash,
+        )
+
+        try:
+            held_identity = b3a_scope.identity
+        except Exception as exc:
+            raise KernelWriteClaimAcquisitionError(
+                "pinned B3A identity is unavailable"
+            ) from exc
+
+        if (
+            not all(
+                isinstance(value, str) and bool(value)
+                for value in identity
+            )
+            or identity != held_identity
+        ):
+            raise KernelWriteClaimAcquisitionError(
+                "write claim identity differs from its pinned B3A target"
+            )
+
+        if (
+            not isinstance(write_claim._pre_continuity_id, str)
+            or not write_claim._pre_continuity_id
+            or not isinstance(write_claim._post_continuity_id, str)
+            or not write_claim._post_continuity_id
+        ):
+            raise KernelWriteClaimAcquisitionError(
+                "write-claim continuity identity is malformed"
+            )
+
+        return (
+            held_reference,
+            identity,
+            write_claim._pre_continuity_id,
+            write_claim._post_continuity_id,
+            write_claim._fd,
+        )
+
+    def __enter__(
+        self,
+    ) -> "_LockedWriteClaimValidationScope":
+        with self._entry_lock:
+            if self._used:
+                raise KernelWriteClaimAcquisitionError(
+                    "write-claim validation scope is single-use"
+                )
+            self._used = True
+
+        self._claim._lifecycle_lock.acquire()
+        b3a_scope = None
+        b3a_entered = False
+
+        try:
+            if (
+                self._claim._closed is not False
+                or type(self._claim._fd) is not int
+                or self._claim._fd < 0
+            ):
+                raise KernelWriteClaimAcquisitionError(
+                    "write claim is not live before B3A pin acquisition"
+                )
+
+            held_reference = self._claim._held_reference
+
+            if (
+                type(held_reference)
+                is not held_ref.HeldKernelTargetReference
+            ):
+                raise KernelWriteClaimAcquisitionError(
+                    "write claim no longer owns an exact B3A reference"
+                )
+
+            b3a_scope = (
+                held_ref
+                ._locked_kernel_target_reference_scope(
+                    held_reference
+                )
+            )
+            b3a_scope.__enter__()
+            b3a_entered = True
+            self._b3a_scope = b3a_scope
+            self._entered = True
+            self._state_locked()
+            return self
+
+        except BaseException as exc:
+            self._entered = False
+            self._b3a_scope = None
+
+            try:
+                if b3a_entered and b3a_scope is not None:
+                    b3a_scope.__exit__(
+                        type(exc),
+                        exc,
+                        exc.__traceback__,
+                    )
+            finally:
+                self._claim._lifecycle_lock.release()
+
+            raise
+
+    def __exit__(
+        self,
+        exc_type: Any,
+        exc: BaseException | None,
+        traceback: Any,
+    ) -> bool:
+        if self._entered is not True:
+            raise KernelWriteClaimAcquisitionError(
+                "write-claim validation scope exit without active entry"
+            )
+
+        b3a_scope = self._b3a_scope
+        self._entered = False
+        self._b3a_scope = None
+
+        try:
+            if b3a_scope is None:
+                raise KernelWriteClaimAcquisitionError(
+                    "write-claim validation scope lost its B3A pin"
+                )
+
+            b3a_scope.__exit__(
+                exc_type,
+                exc,
+                traceback,
+            )
+        finally:
+            self._claim._lifecycle_lock.release()
+
+        return False
+
+    @property
+    def held_reference(
+        self,
+    ) -> held_ref.HeldKernelTargetReference:
+        held_reference, _, _, _, _ = self._state_locked()
+        return held_reference
+
+    @property
+    def identity(
+        self,
+    ) -> tuple[str, str, str, str]:
+        _, identity, _, _, _ = self._state_locked()
+        return identity
+
+    @property
+    def claim_pre_continuity_id(self) -> str:
+        _, _, value, _, _ = self._state_locked()
+        return value
+
+    @property
+    def claim_post_continuity_id(self) -> str:
+        _, _, _, value, _ = self._state_locked()
+        return value
+
+    def revalidate_descriptor(self) -> str:
+        (
+            held_reference,
+            identity,
+            pre_continuity_id,
+            post_continuity_id,
+            fd,
+        ) = self._state_locked()
+
+        observed = _validate_acquired_descriptor(
+            fd,
+            identity[2],
+        )
+
+        if observed != identity[2]:
+            raise KernelWriteClaimAcquisitionError(
+                "locked descriptor identity is inconsistent"
+            )
+
+        (
+            held_reference_after,
+            identity_after,
+            pre_after,
+            post_after,
+            fd_after,
+        ) = self._state_locked()
+
+        if (
+            held_reference_after is not held_reference
+            or identity_after != identity
+            or pre_after != pre_continuity_id
+            or post_after != post_continuity_id
+            or fd_after != fd
+        ):
+            raise KernelWriteClaimAcquisitionError(
+                "write claim changed during locked descriptor validation"
+            )
+
+        return observed
+
+
+def _locked_write_claim_validation_scope(
+    write_claim: Any,
+) -> _LockedWriteClaimValidationScope:
+    """Return the private lifecycle-locked B3F validation scope."""
+
+    return _LockedWriteClaimValidationScope(
+        write_claim
+    )
 
 
 def acquire_kernel_write_claim(
