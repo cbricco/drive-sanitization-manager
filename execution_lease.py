@@ -798,6 +798,181 @@ def create_execution_lease(
         ) from exc
 
 
+class _LockedExecutionLeaseValidationScope:
+    """Private single-use live-lease pin for trusted B3F-B consumers."""
+
+    __slots__ = (
+        "_lease",
+        "_entry_lock",
+        "_used",
+        "_entered",
+        "_claim_scope",
+    )
+
+    def __init__(self, execution_lease: ExecutionLease) -> None:
+        if type(execution_lease) is not ExecutionLease:
+            raise ExecutionLeaseError(
+                "lease validation scope requires an exact B3F-A lease"
+            )
+        self._lease = execution_lease
+        self._entry_lock = threading.Lock()
+        self._used = False
+        self._entered = False
+        self._claim_scope = None
+
+    def _require_entered(self) -> None:
+        if self._entered is not True:
+            raise ExecutionLeaseError(
+                "execution-lease validation scope is not active"
+            )
+
+    def _state_locked(self) -> tuple[tuple[str, str, str, str], str]:
+        self._require_entered()
+        execution_lease = self._lease
+        claim_scope = self._claim_scope
+
+        if (
+            execution_lease._consumed is not False
+            or claim_scope is None
+            or not _internal_integrity_binding_valid(execution_lease)
+        ):
+            raise ExecutionLeaseError(
+                "execution lease is not live and integrity-valid"
+            )
+
+        identity, claim_pre, claim_post = _scope_identity(claim_scope)
+        expected_identity = (
+            execution_lease._handoff_id,
+            execution_lease._target_path,
+            execution_lease._target_major_minor,
+            execution_lease._target_binding_hash,
+        )
+
+        if (
+            identity != expected_identity
+            or claim_pre != execution_lease._claim_pre_continuity_id
+            or claim_post != execution_lease._claim_post_continuity_id
+        ):
+            raise ExecutionLeaseError(
+                "execution lease differs from its pinned B3E-F claim"
+            )
+
+        binding_id = (
+            execution_lease
+            ._execution_authorization_integrity_binding_id
+        )
+        if (
+            not isinstance(binding_id, str)
+            or not binding_id.startswith("xeli_")
+            or len(binding_id) != len("xeli_") + 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in binding_id[len("xeli_"):]
+            )
+        ):
+            raise ExecutionLeaseError(
+                "execution lease internal-integrity binding is malformed"
+            )
+
+        return expected_identity, binding_id
+
+    def __enter__(self) -> "_LockedExecutionLeaseValidationScope":
+        with self._entry_lock:
+            if self._used:
+                raise ExecutionLeaseError(
+                    "execution-lease validation scope is single-use"
+                )
+            self._used = True
+
+        self._lease._state_lock.acquire()
+        claim_scope = None
+        claim_entered = False
+
+        try:
+            if (
+                self._lease._consumed is not False
+                or not _internal_integrity_binding_valid(self._lease)
+            ):
+                raise ExecutionLeaseError(
+                    "execution lease is consumed or integrity-invalid"
+                )
+
+            claim_scope = (
+                claims
+                ._locked_write_claim_validation_scope(
+                    self._lease._write_claim
+                )
+            )
+            claim_scope.__enter__()
+            claim_entered = True
+            self._claim_scope = claim_scope
+            self._entered = True
+
+            identity, _ = self._state_locked()
+            _fresh_safety_cycle(
+                scope=claim_scope,
+                expected_identity=identity,
+                arguments=self._lease._arguments,
+            )
+            self._state_locked()
+            return self
+
+        except BaseException as exc:
+            self._entered = False
+            self._claim_scope = None
+            try:
+                if claim_entered and claim_scope is not None:
+                    claim_scope.__exit__(
+                        type(exc), exc, exc.__traceback__
+                    )
+            finally:
+                self._lease._state_lock.release()
+            raise
+
+    def __exit__(
+        self,
+        exc_type: Any,
+        exc: BaseException | None,
+        traceback: Any,
+    ) -> bool:
+        if self._entered is not True:
+            raise ExecutionLeaseError(
+                "execution-lease validation scope exit without active entry"
+            )
+
+        claim_scope = self._claim_scope
+        self._entered = False
+        self._claim_scope = None
+
+        try:
+            if claim_scope is None:
+                raise ExecutionLeaseError(
+                    "execution-lease validation scope lost B3E-F pin"
+                )
+            claim_scope.__exit__(exc_type, exc, traceback)
+        finally:
+            self._lease._state_lock.release()
+
+        return False
+
+    @property
+    def identity(self) -> tuple[str, str, str, str]:
+        identity, _ = self._state_locked()
+        return identity
+
+    @property
+    def execution_authorization_integrity_binding_id(self) -> str:
+        _, binding_id = self._state_locked()
+        return binding_id
+
+
+def _locked_execution_lease_validation_scope(
+    execution_lease: Any,
+) -> _LockedExecutionLeaseValidationScope:
+    """Return one private B3F-A live-capability validation scope."""
+    return _LockedExecutionLeaseValidationScope(execution_lease)
+
+
 __all__ = [
     "EXECUTION_LEASE_POLICY_VERSION",
     "ExecutionLease",

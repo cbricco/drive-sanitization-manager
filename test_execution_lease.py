@@ -940,5 +940,129 @@ class ExecutionLeaseR2Tests(unittest.TestCase):
             self.assertTrue(result.live)
 
 
+    def test_b3fb_private_scope_exposes_only_identity_and_xeli(self):
+        write_claim = self.claim()
+        mocks = self.environment()
+
+        with mocks.stack:
+            result = self.create(write_claim)
+            with lease._locked_execution_lease_validation_scope(result) as scope:
+                self.assertEqual(
+                    scope.identity,
+                    (
+                        result.handoff_id,
+                        result.target_path,
+                        result.target_major_minor,
+                        result.target_binding_hash,
+                    ),
+                )
+                self.assertEqual(
+                    scope.execution_authorization_integrity_binding_id,
+                    result.execution_authorization_integrity_binding_id,
+                )
+                for name in (
+                    "fd", "fileno", "write_claim", "held_reference",
+                    "read", "write", "seek", "callback", "command",
+                    "subprocess", "executor", "execute",
+                ):
+                    self.assertFalse(hasattr(scope, name), name)
+
+            self.assertNotIn(
+                "_locked_execution_lease_validation_scope",
+                lease.__all__,
+            )
+
+    def test_b3fb_private_scope_reentry_and_reuse_refuse(self):
+        write_claim = self.claim()
+        mocks = self.environment()
+
+        with mocks.stack:
+            result = self.create(write_claim)
+            scope = lease._locked_execution_lease_validation_scope(result)
+            with scope:
+                with self.assertRaisesRegex(
+                    lease.ExecutionLeaseError,
+                    "single-use",
+                ):
+                    scope.__enter__()
+            with self.assertRaisesRegex(
+                lease.ExecutionLeaseError,
+                "single-use",
+            ):
+                scope.__enter__()
+
+    def test_b3fb_private_scope_rejects_consumed_lease(self):
+        write_claim = self.claim()
+        mocks = self.environment()
+
+        with mocks.stack:
+            result = self.create(write_claim)
+            result.consume()
+            with self.assertRaises(lease.ExecutionLeaseError):
+                with lease._locked_execution_lease_validation_scope(result):
+                    self.fail("consumed lease unexpectedly entered scope")
+
+    def test_b3fb_private_scope_blocks_consume_until_exit(self):
+        write_claim = self.claim()
+        mocks = self.environment()
+
+        with mocks.stack:
+            result = self.create(write_claim)
+            started = threading.Event()
+            finished = threading.Event()
+            errors = []
+
+            def consume():
+                started.set()
+                try:
+                    result.consume()
+                except Exception as exc:
+                    errors.append(exc)
+                finally:
+                    finished.set()
+
+            with patch.object(
+                lease,
+                "_fresh_safety_cycle",
+                return_value=(
+                    "hsc_" + ("7" * 64),
+                    "hsc_" + ("8" * 64),
+                ),
+            ):
+                with lease._locked_execution_lease_validation_scope(result):
+                    thread = threading.Thread(target=consume)
+                    thread.start()
+                    self.assertTrue(started.wait(1.0))
+                    self.assertFalse(finished.wait(0.05))
+                    self.assertFalse(result._consumed)
+
+                self.assertTrue(finished.wait(1.0))
+                thread.join(1.0)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertTrue(result.consumed)
+
+    def test_b3fb_private_scope_failure_releases_all_live_locks(self):
+        write_claim = self.claim()
+        mocks = self.environment()
+
+        with mocks.stack:
+            result = self.create(write_claim)
+            with patch.object(
+                lease,
+                "_fresh_safety_cycle",
+                side_effect=RuntimeError(
+                    "synthetic B3F-B validation failure"
+                ),
+            ):
+                with self.assertRaises(RuntimeError):
+                    with lease._locked_execution_lease_validation_scope(result):
+                        self.fail("scope unexpectedly entered")
+
+            self.assertFalse(result.consumed)
+            self.assertTrue(result.live)
+
+
 if __name__ == "__main__":
     unittest.main()
