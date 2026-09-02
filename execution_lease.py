@@ -966,6 +966,74 @@ class _LockedExecutionLeaseValidationScope:
         return binding_id
 
 
+    def _consume_locked_for_executor_ready(
+        self,
+    ) -> tuple[tuple[str, str, str, str], str]:
+        """Consume once while the B3F-C live lock chain is already held.
+
+        The caller must already hold this exact validation scope. This method
+        deliberately never reacquires the non-reentrant lease state lock.
+        """
+
+        self._require_entered()
+
+        execution_lease = self._lease
+        claim_scope = self._claim_scope
+
+        if (
+            execution_lease._consumed is not False
+            or claim_scope is None
+        ):
+            raise ExecutionLeaseError(
+                "execution lease is unavailable for final locked consumption"
+            )
+
+        identity, binding_id = self._state_locked()
+
+        try:
+            observed = claim_scope.revalidate_descriptor()
+            if observed != identity[2]:
+                raise ExecutionLeaseError(
+                    "final locked descriptor identity differs from lease target"
+                )
+
+            _fresh_safety_cycle(
+                scope=claim_scope,
+                expected_identity=identity,
+                arguments=execution_lease._arguments,
+            )
+
+            observed_after = claim_scope.revalidate_descriptor()
+            if observed_after != identity[2]:
+                raise ExecutionLeaseError(
+                    "descriptor identity changed during final safety validation"
+                )
+
+            identity_after, binding_after = self._state_locked()
+            if (
+                identity_after != identity
+                or binding_after != binding_id
+                or not _internal_integrity_binding_valid(execution_lease)
+            ):
+                raise ExecutionLeaseError(
+                    "execution lease changed during final locked consumption"
+                )
+
+            execution_lease._consumed = True
+            return identity_after, binding_after
+
+        except ExecutionLeaseError:
+            raise
+
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+
+            raise ExecutionLeaseError(
+                "final locked executor-ready lease consumption failed"
+            ) from exc
+
+
 def _locked_execution_lease_validation_scope(
     execution_lease: Any,
 ) -> _LockedExecutionLeaseValidationScope:

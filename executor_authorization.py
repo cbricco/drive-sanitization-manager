@@ -850,6 +850,184 @@ def _handoff_and_journal_provenance(
     }
 
 
+
+class _LockedReservedExecutorAuthorizationScope:
+    """Private single-use RESERVED authorization pin for B3F-C."""
+
+    __slots__ = (
+        "_store",
+        "_authorization_id",
+        "_lease",
+        "_lease_binding_id",
+        "_identity",
+        "_entry_lock",
+        "_used",
+        "_entered",
+        "_lock_fd",
+    )
+
+    def __init__(
+        self,
+        *,
+        store: DurableExecutorAuthorizationStore,
+        authorization_id: str,
+        lease: Any,
+        lease_binding_id: str,
+        identity: tuple[str, str, str, str],
+    ) -> None:
+        if type(store) is not DurableExecutorAuthorizationStore:
+            raise ExecutorAuthorizationError(
+                "reserved authorization scope requires the exact store type"
+            )
+        if type(lease) is not _LEASE_TYPE:
+            raise ExecutorAuthorizationError(
+                "reserved authorization scope requires the exact live lease type"
+            )
+        if not _authorization_id(authorization_id):
+            raise ExecutorAuthorizationError(
+                "authorization_id is invalid"
+            )
+        if not _xeli(lease_binding_id):
+            raise ExecutorAuthorizationError(
+                "lease binding ID is invalid"
+            )
+        if (
+            not isinstance(identity, tuple)
+            or len(identity) != 4
+            or not all(_exact_text(value) for value in identity)
+        ):
+            raise ExecutorAuthorizationError(
+                "reserved authorization identity is invalid"
+            )
+
+        self._store = store
+        self._authorization_id = authorization_id
+        self._lease = lease
+        self._lease_binding_id = lease_binding_id
+        self._identity = identity
+        self._entry_lock = threading.Lock()
+        self._used = False
+        self._entered = False
+        self._lock_fd = None
+
+    def _require_entered(self) -> None:
+        if self._entered is not True or self._lock_fd is None:
+            raise ExecutorAuthorizationError(
+                "reserved authorization scope is not active"
+            )
+
+    def _state_locked(self) -> ExecutorAuthorizationRecord:
+        self._require_entered()
+
+        entries = self._store._read_locked()
+        matches = [
+            entry
+            for entry in entries
+            if entry.authorization_id == self._authorization_id
+        ]
+
+        if len(matches) != 1:
+            raise ExecutorAuthorizationError(
+                "reserved executor authorization is unavailable"
+            )
+
+        record = matches[0]
+
+        if (
+            type(record) is not ExecutorAuthorizationRecord
+            or not _record_integrity_valid(record)
+            or record.state != EXECUTOR_AUTHORIZATION_STATE_RESERVED
+            or record.lease_binding_id != self._lease_binding_id
+            or (
+                record.handoff_id,
+                record.target_path,
+                record.target_major_minor,
+                record.target_binding_hash,
+            )
+            != self._identity
+        ):
+            raise ExecutorAuthorizationError(
+                "reserved executor authorization does not match live lease"
+            )
+
+        with _LIVE_AUTHORIZATIONS_LOCK:
+            live_lease = _LIVE_AUTHORIZATIONS.get(
+                self._authorization_id
+            )
+
+        if live_lease is not self._lease:
+            raise ExecutorAuthorizationError(
+                "reserved authorization lost its exact live-lease latch"
+            )
+
+        return record
+
+    def __enter__(
+        self,
+    ) -> "_LockedReservedExecutorAuthorizationScope":
+        with self._entry_lock:
+            if self._used:
+                raise ExecutorAuthorizationError(
+                    "reserved authorization scope is single-use"
+                )
+            self._used = True
+
+        lock_fd = None
+        try:
+            lock_fd = self._store._open_lock()
+            self._lock_fd = lock_fd
+            self._entered = True
+            self._state_locked()
+            return self
+
+        except BaseException:
+            self._entered = False
+            self._lock_fd = None
+            if lock_fd is not None:
+                self._store._close_lock(lock_fd)
+            raise
+
+    def __exit__(
+        self,
+        exc_type: Any,
+        exc: BaseException | None,
+        traceback: Any,
+    ) -> bool:
+        self._require_entered()
+        lock_fd = self._lock_fd
+        self._entered = False
+        self._lock_fd = None
+
+        if lock_fd is None:
+            raise ExecutorAuthorizationError(
+                "reserved authorization scope lost its store lock"
+            )
+
+        self._store._close_lock(lock_fd)
+        return False
+
+    @property
+    def record(self) -> ExecutorAuthorizationRecord:
+        return self._state_locked()
+
+
+def _locked_reserved_executor_authorization_scope(
+    *,
+    store: Any,
+    authorization_id: Any,
+    lease: Any,
+    lease_binding_id: Any,
+    identity: Any,
+) -> _LockedReservedExecutorAuthorizationScope:
+    """Acquire the executor-authorization store lock last in the hierarchy."""
+
+    return _LockedReservedExecutorAuthorizationScope(
+        store=store,
+        authorization_id=authorization_id,
+        lease=lease,
+        lease_binding_id=lease_binding_id,
+        identity=identity,
+    )
 def record_trusted_executor_authorization(
     *,
     store: Any,
