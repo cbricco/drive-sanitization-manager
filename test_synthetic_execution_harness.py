@@ -234,5 +234,131 @@ class SyntheticExecutionHarnessTests(unittest.TestCase):
                 self.assertNotIn(marker, source)
 
 
+    def test_crash_after_durable_tombstone_before_write_refuses_replay(self):
+        medium = self.medium(8192)
+        real_persist = synth._persist_attempt_locked
+
+        def persist_then_crash(value):
+            real_persist(value)
+            raise RuntimeError("synthetic-crash-after-tombstone")
+
+        with patch.object(
+            synth,
+            "_persist_attempt_locked",
+            side_effect=persist_then_crash,
+        ), patch.object(synth.os, "pwrite") as pwrite:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "synthetic-crash-after-tombstone",
+            ):
+                synth.execute_disposable_synthetic_zero_pass(medium)
+            pwrite.assert_not_called()
+
+        self.assertFalse(medium.attempted)
+        self.assertTrue(medium._marker.exists())
+
+        with self.assertRaisesRegex(
+            synth.SyntheticExecutionError,
+            "replay refused",
+        ):
+            synth.execute_disposable_synthetic_zero_pass(medium)
+
+    def test_mid_write_crash_is_ambiguous_and_nonreplayable(self):
+        medium = self.medium(8192)
+        real_pwrite = os.pwrite
+        calls = 0
+
+        def partial_then_crash(fd, data, offset):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return real_pwrite(fd, data, offset)
+            raise RuntimeError("synthetic-mid-write-crash")
+
+        with patch.object(
+            synth.os,
+            "pwrite",
+            side_effect=partial_then_crash,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "synthetic-mid-write-crash",
+            ):
+                synth.execute_disposable_synthetic_zero_pass(medium)
+
+        self.assertTrue(medium.attempted)
+        self.assertTrue(medium._marker.exists())
+        self.assertEqual(
+            os.pread(medium._fd, 4096, 0),
+            b"\x00" * 4096,
+        )
+        self.assertEqual(
+            os.pread(medium._fd, 4096, 4096),
+            b"\xA5" * 4096,
+        )
+
+        with self.assertRaises(synth.SyntheticExecutionError):
+            synth.execute_disposable_synthetic_zero_pass(medium)
+
+    def test_crash_after_overwrite_before_verification_is_nonreplayable(self):
+        medium = self.medium(8192)
+        real_fsync = os.fsync
+        calls = 0
+
+        def crash_on_medium_fsync(fd):
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                raise RuntimeError("synthetic-post-write-crash")
+            return real_fsync(fd)
+
+        with patch.object(
+            synth.os,
+            "fsync",
+            side_effect=crash_on_medium_fsync,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "synthetic-post-write-crash",
+            ):
+                synth.execute_disposable_synthetic_zero_pass(medium)
+
+        self.assertTrue(medium.attempted)
+        self.assertTrue(medium._marker.exists())
+        self.assertEqual(
+            os.pread(medium._fd, 8192, 0),
+            b"\x00" * 8192,
+        )
+
+        with self.assertRaises(synth.SyntheticExecutionError):
+            synth.execute_disposable_synthetic_zero_pass(medium)
+
+    def test_crash_after_verification_before_result_is_nonreplayable(self):
+        medium = self.medium(8192)
+
+        with patch.object(
+            synth,
+            "SyntheticExecutionResult",
+            side_effect=RuntimeError(
+                "synthetic-post-verification-crash"
+            ),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "synthetic-post-verification-crash",
+            ):
+                synth.execute_disposable_synthetic_zero_pass(medium)
+
+        self.assertTrue(medium.attempted)
+        self.assertTrue(medium._marker.exists())
+        self.assertEqual(
+            os.pread(medium._fd, 8192, 0),
+            b"\x00" * 8192,
+        )
+
+        with self.assertRaises(synth.SyntheticExecutionError):
+            synth.execute_disposable_synthetic_zero_pass(medium)
+
+
 if __name__ == "__main__":
     unittest.main()
