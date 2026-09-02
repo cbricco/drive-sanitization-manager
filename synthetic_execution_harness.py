@@ -20,6 +20,7 @@ from typing import Any
 
 POLICY_VERSION = "phase6e-synthetic-regular-file-execution-v1"
 ATTEMPTING = "ATTEMPTING"
+RESULT_RECORDED = "SYNTHETIC_RESULT_RECORDED"
 DEFAULT_SIZE = 64 * 1024
 MAX_SIZE = 4 * 1024 * 1024
 _CHUNK = 4096
@@ -83,19 +84,21 @@ def _hash(payload: dict[str, Any]) -> str:
 
 class DisposableSyntheticMedium:
     __slots__ = (
-        "_root", "_path", "_marker", "_medium_id", "_fd", "_size",
+        "_root", "_path", "_marker", "_result", "_medium_id", "_fd", "_size",
         "_dev", "_ino", "_lock", "_attempted", "_closed",
     )
 
     def __init__(
         self, token: object, *, root: Path, path: Path, marker: Path,
-        medium_id: str, fd: int, size: int, dev: int, ino: int,
+        result: Path, medium_id: str, fd: int, size: int,
+        dev: int, ino: int,
     ):
         if token is not _TOKEN:
             raise TypeError("use create_disposable_synthetic_medium()")
         self._root = root
         self._path = path
         self._marker = marker
+        self._result = result
         self._medium_id = medium_id
         self._fd = fd
         self._size = size
@@ -195,6 +198,7 @@ def create_disposable_synthetic_medium(root: Any, *, size_bytes: int = DEFAULT_S
     medium_id = "xesynth_" + secrets.token_hex(32)
     path = root / f"{medium_id}.bin"
     marker = root / f"{medium_id}.attempting.json"
+    result = root / f"{medium_id}.synthetic-result.json"
     flags = (
         os.O_RDWR | os.O_CREAT | os.O_EXCL
         | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -222,7 +226,7 @@ def create_disposable_synthetic_medium(root: Any, *, size_bytes: int = DEFAULT_S
         ):
             raise SyntheticExecutionError("new medium validation failed")
         return DisposableSyntheticMedium(
-            _TOKEN, root=root, path=path, marker=marker,
+            _TOKEN, root=root, path=path, marker=marker, result=result,
             medium_id=medium_id, fd=fd, size=size_bytes,
             dev=info.st_dev, ino=info.st_ino,
         )
@@ -292,6 +296,235 @@ def _persist_attempt_locked(medium: DisposableSyntheticMedium):
             os.close(directory_fd)
 
 
+def _read_private_record(path: Path):
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    fd = None
+    try:
+        fd = os.open(path, flags)
+        info = os.fstat(fd)
+
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_size <= 0
+            or info.st_size > 16 * 1024
+        ):
+            raise SyntheticExecutionError(
+                "synthetic evidence record is not exact private regular file"
+            )
+
+        chunks = []
+        remaining = info.st_size
+        while remaining:
+            chunk = os.read(fd, min(4096, remaining))
+            if not chunk:
+                raise SyntheticExecutionError(
+                    "synthetic evidence record ended early"
+                )
+            chunks.append(chunk)
+            remaining -= len(chunk)
+
+    except OSError as exc:
+        raise SyntheticExecutionError(
+            "synthetic evidence record is unavailable"
+        ) from exc
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+    try:
+        document = json.loads(
+            b"".join(chunks).decode("utf-8")
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SyntheticExecutionError(
+            "synthetic evidence record is malformed"
+        ) from exc
+
+    if type(document) is not dict:
+        raise SyntheticExecutionError(
+            "synthetic evidence record is not an object"
+        )
+
+    record_hash = document.get("record_hash")
+    payload = dict(document)
+    payload.pop("record_hash", None)
+
+    if record_hash != _hash(payload):
+        raise SyntheticExecutionError(
+            "synthetic evidence record integrity failed"
+        )
+
+    return document
+
+
+def _expected_attempt_payload_locked(
+    medium: DisposableSyntheticMedium,
+):
+    return {
+        "automatic_replay_allowed": False,
+        "medium_id": medium._medium_id,
+        "policy_version": POLICY_VERSION,
+        "production_execution": False,
+        "real_block_device_accessed": False,
+        "state": ATTEMPTING,
+        "st_dev": medium._dev,
+        "st_ino": medium._ino,
+        "size_bytes": medium._size,
+    }
+
+
+def _read_attempt_record_locked(
+    medium: DisposableSyntheticMedium,
+):
+    document = _read_private_record(medium._marker)
+    payload = _expected_attempt_payload_locked(medium)
+    expected = {
+        **payload,
+        "record_hash": _hash(payload),
+    }
+
+    if document != expected:
+        raise SyntheticExecutionError(
+            "durable ATTEMPTING tombstone changed"
+        )
+
+    return document
+
+
+def _result_payload_locked(
+    medium: DisposableSyntheticMedium,
+):
+    return {
+        "attempt_state": ATTEMPTING,
+        "automatic_replay_allowed": False,
+        "bytes_overwritten": medium._size,
+        "medium_id": medium._medium_id,
+        "policy_version": POLICY_VERSION,
+        "production_execution": False,
+        "real_block_device_accessed": False,
+        "sanitization_verified": False,
+        "size_bytes": medium._size,
+        "st_dev": medium._dev,
+        "st_ino": medium._ino,
+        "state": RESULT_RECORDED,
+        "synthetic_pattern_verified": True,
+        "write_returned": True,
+    }
+
+
+def _read_result_record_locked(
+    medium: DisposableSyntheticMedium,
+):
+    document = _read_private_record(medium._result)
+    payload = _result_payload_locked(medium)
+    expected = {
+        **payload,
+        "record_hash": _hash(payload),
+    }
+
+    if document != expected:
+        raise SyntheticExecutionError(
+            "durable synthetic result evidence changed"
+        )
+
+    return document
+
+
+def _persist_result_locked(
+    medium: DisposableSyntheticMedium,
+):
+    # The original ATTEMPTING tombstone remains authoritative and unchanged.
+    attempt_before = _read_attempt_record_locked(medium)
+
+    payload = _result_payload_locked(medium)
+    record = {
+        **payload,
+        "record_hash": _hash(payload),
+    }
+
+    encoded = (
+        json.dumps(
+            record,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+
+    result_fd = None
+    directory_fd = None
+
+    try:
+        result_fd = os.open(
+            medium._result,
+            flags,
+            0o600,
+        )
+        os.fchmod(result_fd, 0o600)
+
+        offset = 0
+        while offset < len(encoded):
+            written = os.write(
+                result_fd,
+                encoded[offset:],
+            )
+            if written <= 0:
+                raise SyntheticExecutionError(
+                    "synthetic result evidence write stalled"
+                )
+            offset += written
+
+        os.fsync(result_fd)
+        os.close(result_fd)
+        result_fd = None
+
+        directory_fd = os.open(
+            medium._root,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        os.fsync(directory_fd)
+
+    except FileExistsError as exc:
+        raise SyntheticExecutionError(
+            "synthetic result evidence already exists"
+        ) from exc
+    finally:
+        if result_fd is not None:
+            os.close(result_fd)
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+    persisted = _read_result_record_locked(medium)
+
+    if persisted != record:
+        raise SyntheticExecutionError(
+            "synthetic result evidence verification failed"
+        )
+
+    if _read_attempt_record_locked(medium) != attempt_before:
+        raise SyntheticExecutionError(
+            "ATTEMPTING tombstone changed during result persistence"
+        )
+
+    return persisted
+
+
 def execute_disposable_synthetic_zero_pass(medium: Any):
     if type(medium) is not DisposableSyntheticMedium:
         raise SyntheticExecutionError("exact disposable medium required")
@@ -326,6 +559,7 @@ def execute_disposable_synthetic_zero_pass(medium: Any):
             offset += length
 
         medium._validate_locked()
+        _persist_result_locked(medium)
         return SyntheticExecutionResult(
             medium_id=medium._medium_id,
             bytes_overwritten=medium._size,
@@ -340,7 +574,7 @@ def execute_disposable_synthetic_zero_pass(medium: Any):
 
 
 __all__ = [
-    "ATTEMPTING", "DEFAULT_SIZE", "MAX_SIZE", "POLICY_VERSION",
+    "ATTEMPTING", "RESULT_RECORDED", "DEFAULT_SIZE", "MAX_SIZE", "POLICY_VERSION",
     "DisposableSyntheticMedium", "SyntheticExecutionError",
     "SyntheticExecutionResult", "create_disposable_synthetic_medium",
     "execute_disposable_synthetic_zero_pass",

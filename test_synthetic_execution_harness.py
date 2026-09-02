@@ -360,5 +360,261 @@ class SyntheticExecutionHarnessTests(unittest.TestCase):
             synth.execute_disposable_synthetic_zero_pass(medium)
 
 
+    def test_durable_result_evidence_is_conservative(self):
+        medium = self.medium(8192)
+        result = synth.execute_disposable_synthetic_zero_pass(medium)
+
+        doc = json.loads(
+            medium._result.read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(
+            doc["state"],
+            synth.RESULT_RECORDED,
+        )
+        self.assertEqual(
+            doc["attempt_state"],
+            synth.ATTEMPTING,
+        )
+        self.assertTrue(doc["write_returned"])
+        self.assertTrue(
+            doc["synthetic_pattern_verified"]
+        )
+        self.assertFalse(doc["sanitization_verified"])
+        self.assertFalse(doc["production_execution"])
+        self.assertFalse(
+            doc["real_block_device_accessed"]
+        )
+        self.assertFalse(
+            doc["automatic_replay_allowed"]
+        )
+
+        self.assertFalse(result.sanitization_verified)
+
+        attempt_doc = json.loads(
+            medium._marker.read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            attempt_doc["state"],
+            synth.ATTEMPTING,
+        )
+
+        payload = dict(doc)
+        record_hash = payload.pop("record_hash")
+        self.assertEqual(
+            record_hash,
+            synth._hash(payload),
+        )
+
+    def test_result_evidence_is_persisted_after_verification(self):
+        medium = self.medium(8192)
+        events = []
+
+        real_pread = os.pread
+        real_result = synth._persist_result_locked
+
+        def pread(fd, length, offset):
+            events.append("verify")
+            return real_pread(fd, length, offset)
+
+        def persist_result(value):
+            events.append("result")
+            return real_result(value)
+
+        with patch.object(
+            synth.os,
+            "pread",
+            side_effect=pread,
+        ), patch.object(
+            synth,
+            "_persist_result_locked",
+            side_effect=persist_result,
+        ):
+            synth.execute_disposable_synthetic_zero_pass(
+                medium
+            )
+
+        self.assertIn("verify", events)
+        self.assertEqual(events[-1], "result")
+        self.assertLess(
+            events.index("verify"),
+            events.index("result"),
+        )
+
+    def test_verification_failure_creates_no_result_evidence(self):
+        medium = self.medium(8192)
+
+        with patch.object(
+            synth.os,
+            "pread",
+            return_value=b"\x01" * 4096,
+        ):
+            with self.assertRaises(
+                synth.SyntheticExecutionError
+            ):
+                synth.execute_disposable_synthetic_zero_pass(
+                    medium
+                )
+
+        self.assertTrue(medium._marker.exists())
+        self.assertFalse(medium._result.exists())
+        self.assertTrue(medium.attempted)
+
+    def test_result_persistence_failure_is_nonreplayable(self):
+        medium = self.medium(8192)
+
+        with patch.object(
+            synth,
+            "_persist_result_locked",
+            side_effect=RuntimeError(
+                "synthetic-result-persist-failure"
+            ),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "synthetic-result-persist-failure",
+            ):
+                synth.execute_disposable_synthetic_zero_pass(
+                    medium
+                )
+
+        self.assertTrue(medium.attempted)
+        self.assertTrue(medium._marker.exists())
+        self.assertFalse(medium._result.exists())
+
+        with self.assertRaises(
+            synth.SyntheticExecutionError
+        ):
+            synth.execute_disposable_synthetic_zero_pass(
+                medium
+            )
+
+    def test_crash_after_durable_result_before_return_is_nonreplayable(self):
+        medium = self.medium(8192)
+        real_result = synth._persist_result_locked
+
+        def persist_then_crash(value):
+            real_result(value)
+            raise RuntimeError(
+                "synthetic-post-result-crash"
+            )
+
+        with patch.object(
+            synth,
+            "_persist_result_locked",
+            side_effect=persist_then_crash,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "synthetic-post-result-crash",
+            ):
+                synth.execute_disposable_synthetic_zero_pass(
+                    medium
+                )
+
+        self.assertTrue(medium._marker.exists())
+        self.assertTrue(medium._result.exists())
+        self.assertTrue(medium.attempted)
+
+        with medium._lock:
+            record = synth._read_result_record_locked(
+                medium
+            )
+        self.assertEqual(
+            record["state"],
+            synth.RESULT_RECORDED,
+        )
+
+        with self.assertRaises(
+            synth.SyntheticExecutionError
+        ):
+            synth.execute_disposable_synthetic_zero_pass(
+                medium
+            )
+
+    def test_preexisting_result_evidence_is_never_overwritten(self):
+        medium = self.medium(8192)
+
+        medium._result.write_bytes(b"sentinel")
+        os.chmod(medium._result, 0o600)
+
+        with self.assertRaisesRegex(
+            synth.SyntheticExecutionError,
+            "already exists",
+        ):
+            synth.execute_disposable_synthetic_zero_pass(
+                medium
+            )
+
+        self.assertEqual(
+            medium._result.read_bytes(),
+            b"sentinel",
+        )
+        self.assertTrue(medium._marker.exists())
+        self.assertTrue(medium.attempted)
+
+        with self.assertRaises(
+            synth.SyntheticExecutionError
+        ):
+            synth.execute_disposable_synthetic_zero_pass(
+                medium
+            )
+
+    def test_tampered_result_evidence_is_not_trusted(self):
+        medium = self.medium(8192)
+        synth.execute_disposable_synthetic_zero_pass(
+            medium
+        )
+
+        doc = json.loads(
+            medium._result.read_text(encoding="utf-8")
+        )
+        doc["sanitization_verified"] = True
+        medium._result.write_text(
+            json.dumps(doc) + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(medium._result, 0o600)
+
+        with medium._lock:
+            with self.assertRaises(
+                synth.SyntheticExecutionError
+            ):
+                synth._read_result_record_locked(
+                    medium
+                )
+
+    def test_result_evidence_survives_medium_close(self):
+        medium = self.medium(8192)
+        synth.execute_disposable_synthetic_zero_pass(
+            medium
+        )
+
+        result_path = medium._result
+        medium.close()
+
+        info = os.lstat(result_path)
+        self.assertTrue(stat.S_ISREG(info.st_mode))
+        self.assertEqual(
+            stat.S_IMODE(info.st_mode),
+            0o600,
+        )
+
+        doc = json.loads(
+            result_path.read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            doc["state"],
+            synth.RESULT_RECORDED,
+        )
+        self.assertEqual(
+            doc["attempt_state"],
+            synth.ATTEMPTING,
+        )
+        self.assertFalse(
+            doc["sanitization_verified"]
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
