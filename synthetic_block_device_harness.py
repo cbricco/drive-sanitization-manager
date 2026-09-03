@@ -19,6 +19,8 @@ from __future__ import annotations
 import copy
 import glob
 import hashlib
+import json
+import threading
 import os
 import re
 import stat
@@ -30,6 +32,11 @@ LOOP_MAJOR = 7
 MIN_SYNTHETIC_SIZE = 2 * 1024 * 1024
 MAX_SYNTHETIC_SIZE = 64 * 1024 * 1024
 MAX_BOUNDED_WRITE = 1024 * 1024
+
+DURABLE_BLOCK_POLICY_VERSION = "synthetic-loop-block-durable-v1"
+DURABLE_BLOCK_ATTEMPTING = "ATTEMPTING"
+DURABLE_BLOCK_RESULT_RECORDED = "SYNTHETIC_BLOCK_RESULT_RECORDED"
+_DURABLE_MAX_RECORD_BYTES = 32 * 1024
 
 _TOKEN = object()
 _LOOP_RE = re.compile(r"^/dev/loop([0-9]+)$")
@@ -282,6 +289,11 @@ def _validate_private_backing_image(
             "synthetic backing image must have mode 0600"
         )
 
+    if lst.st_nlink != 1:
+        raise SyntheticBlockDeviceError(
+            "synthetic backing image must have exactly one hard link"
+        )
+
     if not (
         MIN_SYNTHETIC_SIZE
         <= lst.st_size
@@ -313,6 +325,7 @@ class DisposableLoopBlockMedium:
         "_image_ino",
         "_consumed",
         "_closed",
+        "_lock",
     )
 
     def __init__(
@@ -346,6 +359,7 @@ class DisposableLoopBlockMedium:
         object.__setattr__(self, "_image_ino", image_ino)
         object.__setattr__(self, "_consumed", False)
         object.__setattr__(self, "_closed", False)
+        object.__setattr__(self, "_lock", threading.RLock())
 
     def __setattr__(self, name: str, value: Any) -> None:
         raise SyntheticBlockDeviceError(
@@ -813,18 +827,656 @@ def _revalidate_medium(
         )
 
 
+
+def _durable_hash(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_durable_evidence_root(
+    evidence_root: str | os.PathLike[str],
+) -> Path:
+    try:
+        raw = os.fspath(evidence_root)
+    except TypeError as exc:
+        raise SyntheticBlockDeviceError(
+            "durable evidence root must be path-like"
+        ) from exc
+
+    if not os.path.isabs(raw):
+        raise SyntheticBlockDeviceError(
+            "durable evidence root must be absolute"
+        )
+
+    absolute = os.path.abspath(raw)
+    real = os.path.realpath(raw)
+
+    if real != absolute:
+        raise SyntheticBlockDeviceError(
+            "durable evidence root must not use symlink aliases"
+        )
+
+    try:
+        info = os.lstat(raw)
+    except OSError as exc:
+        raise SyntheticBlockDeviceError(
+            "cannot inspect durable evidence root"
+        ) from exc
+
+    if not stat.S_ISDIR(info.st_mode):
+        raise SyntheticBlockDeviceError(
+            "durable evidence root must be a directory"
+        )
+
+    if info.st_uid != os.geteuid():
+        raise SyntheticBlockDeviceError(
+            "durable evidence root must be owned by current user"
+        )
+
+    if stat.S_IMODE(info.st_mode) != 0o700:
+        raise SyntheticBlockDeviceError(
+            "durable evidence root must have mode 0700"
+        )
+
+    return Path(real)
+
+
+def _durable_evidence_root_for_medium(
+    medium: DisposableLoopBlockMedium,
+) -> Path:
+    return (
+        Path(medium._backing_path).parent
+        / ".dsm-synthetic-block-evidence"
+    )
+
+
+def _validate_bound_durable_evidence_root(
+    evidence_root: str | os.PathLike[str],
+    medium: DisposableLoopBlockMedium,
+) -> Path:
+    root = _validate_durable_evidence_root(
+        evidence_root
+    )
+
+    expected = _durable_evidence_root_for_medium(
+        medium
+    )
+
+    expected_absolute = Path(
+        os.path.abspath(os.fspath(expected))
+    )
+
+    if root != expected_absolute:
+        raise SyntheticBlockDeviceError(
+            "durable evidence root differs from "
+            "the backing-image-bound root"
+        )
+
+    return root
+
+
+def _durable_identity_payload(
+    medium: DisposableLoopBlockMedium,
+) -> dict[str, Any]:
+    # This is deliberately medium-level rather than operation-level.
+    # After an ambiguous ATTEMPTING state, changing offset, length,
+    # pattern, or loop number must not create a fresh replay identity.
+    return {
+        "backing_path": medium._backing_path,
+        "backing_st_dev": medium._image_dev,
+        "backing_st_ino": medium._image_ino,
+        "backing_size_bytes": medium._size,
+        "policy_version": DURABLE_BLOCK_POLICY_VERSION,
+    }
+
+
+def _durable_evidence_id(
+    medium: DisposableLoopBlockMedium,
+) -> str:
+    return _durable_hash(
+        _durable_identity_payload(medium)
+    )
+
+
+def _durable_evidence_paths(
+    evidence_root: str | os.PathLike[str],
+    medium: DisposableLoopBlockMedium,
+) -> tuple[Path, Path]:
+    root = _validate_bound_durable_evidence_root(
+        evidence_root,
+        medium,
+    )
+
+    evidence_id = _durable_evidence_id(
+        medium
+    )
+
+    return (
+        root / f"{evidence_id}.attempting.json",
+        root / f"{evidence_id}.synthetic-block-result.json",
+    )
+
+
+def _refuse_existing_durable_result(
+    result_path: Path,
+) -> None:
+    try:
+        os.lstat(result_path)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise SyntheticBlockDeviceError(
+            "cannot inspect durable synthetic block result path"
+        ) from exc
+
+    raise SyntheticBlockDeviceError(
+        "durable synthetic block result exists; execution refused"
+    )
+
+
+def _durable_record(
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        **payload,
+        "record_hash": _durable_hash(payload),
+    }
+
+
+def _read_durable_private_record(path: Path) -> dict[str, Any]:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+
+    fd: int | None = None
+
+    try:
+        fd = os.open(path, flags)
+        info = os.fstat(fd)
+
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_size <= 0
+            or info.st_size > _DURABLE_MAX_RECORD_BYTES
+        ):
+            raise SyntheticBlockDeviceError(
+                "durable synthetic block evidence is not an exact "
+                "private regular file"
+            )
+
+        chunks: list[bytes] = []
+        remaining = info.st_size
+
+        while remaining:
+            chunk = os.read(fd, min(4096, remaining))
+            if not chunk:
+                raise SyntheticBlockDeviceError(
+                    "durable synthetic block evidence ended early"
+                )
+            chunks.append(chunk)
+            remaining -= len(chunk)
+
+    except OSError as exc:
+        raise SyntheticBlockDeviceError(
+            "durable synthetic block evidence is unavailable"
+        ) from exc
+
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+    try:
+        document = json.loads(
+            b"".join(chunks).decode("utf-8")
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SyntheticBlockDeviceError(
+            "durable synthetic block evidence is malformed"
+        ) from exc
+
+    if type(document) is not dict:
+        raise SyntheticBlockDeviceError(
+            "durable synthetic block evidence is not an object"
+        )
+
+    record_hash = document.get("record_hash")
+    payload = dict(document)
+    payload.pop("record_hash", None)
+
+    if record_hash != _durable_hash(payload):
+        raise SyntheticBlockDeviceError(
+            "durable synthetic block evidence integrity failed"
+        )
+
+    return document
+
+
+def _write_new_durable_private_record(
+    root: Path,
+    path: Path,
+    payload: dict[str, Any],
+    *,
+    exists_message: str,
+) -> dict[str, Any]:
+    validated_root = _validate_durable_evidence_root(root)
+
+    if path.parent != validated_root:
+        raise SyntheticBlockDeviceError(
+            "durable evidence path escaped private root"
+        )
+
+    record = _durable_record(payload)
+
+    encoded = (
+        json.dumps(
+            record,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+
+    if len(encoded) > _DURABLE_MAX_RECORD_BYTES:
+        raise SyntheticBlockDeviceError(
+            "durable synthetic block evidence is too large"
+        )
+
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+
+    fd: int | None = None
+    directory_fd: int | None = None
+
+    try:
+        fd = os.open(path, flags, 0o600)
+        os.fchmod(fd, 0o600)
+        os.set_inheritable(fd, False)
+
+        if os.get_inheritable(fd):
+            raise SyntheticBlockDeviceError(
+                "durable evidence descriptor is inheritable"
+            )
+
+        position = 0
+
+        while position < len(encoded):
+            written = os.write(fd, encoded[position:])
+            if written <= 0:
+                raise SyntheticBlockDeviceError(
+                    "durable evidence write stalled"
+                )
+            position += written
+
+        os.fsync(fd)
+        os.close(fd)
+        fd = None
+
+        directory_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+
+        directory_fd = os.open(
+            validated_root,
+            directory_flags,
+        )
+        os.fsync(directory_fd)
+
+    except FileExistsError as exc:
+        raise SyntheticBlockDeviceError(
+            exists_message
+        ) from exc
+
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+    persisted = _read_durable_private_record(path)
+
+    if persisted != record:
+        raise SyntheticBlockDeviceError(
+            "durable evidence verification failed"
+        )
+
+    return persisted
+
+
+def _durable_attempt_payload(
+    medium: DisposableLoopBlockMedium,
+    *,
+    offset: int,
+    length: int,
+    pattern_byte: int,
+) -> dict[str, Any]:
+    return {
+        **_durable_identity_payload(medium),
+        "automatic_replay_allowed": False,
+        "block_special_device_accessed": True,
+        "evidence_id": _durable_evidence_id(medium),
+        "loop_major_minor": medium.major_minor,
+        "pattern_byte": pattern_byte,
+        "physical_drive_accessed": False,
+        "production_execution": False,
+        "sanitization_verified": False,
+        "state": DURABLE_BLOCK_ATTEMPTING,
+        "synthetic_loop_block_device_accessed": True,
+        "write_length": length,
+        "write_offset": offset,
+    }
+
+
+def _persist_durable_block_attempt(
+    medium: DisposableLoopBlockMedium,
+    *,
+    evidence_root: str | os.PathLike[str],
+    offset: int,
+    length: int,
+    pattern_byte: int,
+) -> tuple[Path, Path, dict[str, Any]]:
+    root = _validate_bound_durable_evidence_root(
+        evidence_root,
+        medium,
+    )
+
+    attempt_path, result_path = _durable_evidence_paths(
+        root,
+        medium,
+    )
+
+    # Inconsistent pre-existing completion evidence must fail before
+    # the destructive primitive can run.
+    _refuse_existing_durable_result(
+        result_path
+    )
+
+    payload = _durable_attempt_payload(
+        medium,
+        offset=offset,
+        length=length,
+        pattern_byte=pattern_byte,
+    )
+
+    persisted = _write_new_durable_private_record(
+        root,
+        attempt_path,
+        payload,
+        exists_message=(
+            "durable ATTEMPTING evidence exists; replay refused"
+        ),
+    )
+
+    expected = _durable_record(payload)
+
+    if persisted != expected:
+        raise SyntheticBlockDeviceError(
+            "durable ATTEMPTING evidence verification failed"
+        )
+
+    # Check again after ATTEMPTING creation. Any result that appeared
+    # concurrently leaves the attempt tombstone in place and stops
+    # before destructive execution.
+    _refuse_existing_durable_result(
+        result_path
+    )
+
+    return attempt_path, result_path, persisted
+
+
+def _durable_result_payload(
+    medium: DisposableLoopBlockMedium,
+    result: SyntheticBlockResult,
+    *,
+    offset: int,
+    length: int,
+    pattern_byte: int,
+) -> dict[str, Any]:
+    return {
+        **_durable_identity_payload(medium),
+        "attempt_state": DURABLE_BLOCK_ATTEMPTING,
+        "automatic_replay_allowed": False,
+        "before_sha256": result.before_sha256,
+        "after_sha256": result.after_sha256,
+        "block_special_device_accessed": True,
+        "bytes_overwritten": length,
+        "evidence_id": _durable_evidence_id(medium),
+        "loop_major_minor": result.loop_major_minor,
+        "outside_region_verified": True,
+        "pattern_byte": pattern_byte,
+        "physical_drive_accessed": False,
+        "production_execution": False,
+        "sanitization_verified": False,
+        "state": DURABLE_BLOCK_RESULT_RECORDED,
+        "synthetic_loop_block_device_accessed": True,
+        "synthetic_pattern_verified": True,
+        "write_length": length,
+        "write_offset": offset,
+        "write_returned": True,
+    }
+
+
+def _persist_durable_block_result(
+    medium: DisposableLoopBlockMedium,
+    result: SyntheticBlockResult,
+    *,
+    evidence_root: str | os.PathLike[str],
+    offset: int,
+    length: int,
+    pattern_byte: int,
+) -> dict[str, Any]:
+    root = _validate_bound_durable_evidence_root(
+        evidence_root,
+        medium,
+    )
+
+    attempt_path, result_path = _durable_evidence_paths(
+        root,
+        medium,
+    )
+
+    attempt_before = _read_durable_private_record(
+        attempt_path
+    )
+
+    expected_attempt = _durable_record(
+        _durable_attempt_payload(
+            medium,
+            offset=offset,
+            length=length,
+            pattern_byte=pattern_byte,
+        )
+    )
+
+    if attempt_before != expected_attempt:
+        raise SyntheticBlockDeviceError(
+            "durable ATTEMPTING evidence changed"
+        )
+
+    payload = _durable_result_payload(
+        medium,
+        result,
+        offset=offset,
+        length=length,
+        pattern_byte=pattern_byte,
+    )
+
+    persisted = _write_new_durable_private_record(
+        root,
+        result_path,
+        payload,
+        exists_message=(
+            "durable synthetic block result already exists"
+        ),
+    )
+
+    expected_result = _durable_record(payload)
+
+    if persisted != expected_result:
+        raise SyntheticBlockDeviceError(
+            "durable synthetic block result verification failed"
+        )
+
+    if (
+        _read_durable_private_record(attempt_path)
+        != attempt_before
+    ):
+        raise SyntheticBlockDeviceError(
+            "durable ATTEMPTING evidence changed during result persistence"
+        )
+
+    return persisted
+
+
+def _validate_durable_execution_request(
+    medium: DisposableLoopBlockMedium,
+    *,
+    offset: int,
+    length: int,
+    pattern_byte: int,
+) -> None:
+    if (
+        not isinstance(medium, DisposableLoopBlockMedium)
+        or medium._token is not _TOKEN
+    ):
+        raise SyntheticBlockDeviceError(
+            "wrong synthetic block medium"
+        )
+
+    if medium._closed:
+        raise SyntheticBlockDeviceError(
+            "synthetic loop medium is closed"
+        )
+
+    if medium._consumed:
+        raise SyntheticBlockDeviceError(
+            "synthetic loop medium is one-shot and already consumed"
+        )
+
+    if not isinstance(offset, int) or not isinstance(length, int):
+        raise SyntheticBlockDeviceError(
+            "bounded write geometry must be integer"
+        )
+
+    if offset < 0 or length <= 0:
+        raise SyntheticBlockDeviceError(
+            "invalid bounded write geometry"
+        )
+
+    if length > MAX_BOUNDED_WRITE:
+        raise SyntheticBlockDeviceError(
+            "bounded synthetic write is too large"
+        )
+
+    if offset + length > medium._size:
+        raise SyntheticBlockDeviceError(
+            "bounded write exceeds synthetic medium"
+        )
+
+    if (
+        not isinstance(pattern_byte, int)
+        or not 0 <= pattern_byte <= 255
+    ):
+        raise SyntheticBlockDeviceError(
+            "pattern byte must be in range 0..255"
+        )
+
+
 def execute_bounded_synthetic_pattern_pass(
+    medium: DisposableLoopBlockMedium,
+    *,
+    evidence_root: str | os.PathLike[str],
+    offset: int,
+    length: int,
+    pattern_byte: int = 0x3C,
+) -> SyntheticBlockResult:
+    """Execute one bounded synthetic pass behind durable replay evidence.
+
+    The evidence root is required to be the deterministic private evidence
+    directory adjacent to the exact synthetic backing image. ATTEMPTING
+    evidence is durable before the private destructive primitive can run.
+
+    The replay identity is medium-level: after an ambiguous attempt, changing
+    loop number, offset, length, or pattern cannot authorize another pass.
+    """
+    if (
+        not isinstance(medium, DisposableLoopBlockMedium)
+        or medium._token is not _TOKEN
+    ):
+        raise SyntheticBlockDeviceError(
+            "wrong synthetic block medium"
+        )
+
+    with medium._lock:
+        _validate_durable_execution_request(
+            medium,
+            offset=offset,
+            length=length,
+            pattern_byte=pattern_byte,
+        )
+
+        root = _validate_bound_durable_evidence_root(
+            evidence_root,
+            medium,
+        )
+
+        _revalidate_medium(medium)
+
+        _persist_durable_block_attempt(
+            medium,
+            evidence_root=root,
+            offset=offset,
+            length=length,
+            pattern_byte=pattern_byte,
+        )
+
+        result = _execute_bounded_synthetic_pattern_pass_once(
+            medium,
+            offset=offset,
+            length=length,
+            pattern_byte=pattern_byte,
+        )
+
+        _persist_durable_block_result(
+            medium,
+            result,
+            evidence_root=root,
+            offset=offset,
+            length=length,
+            pattern_byte=pattern_byte,
+        )
+
+        return result
+
+
+def _execute_bounded_synthetic_pattern_pass_once(
     medium: DisposableLoopBlockMedium,
     *,
     offset: int,
     length: int,
     pattern_byte: int = 0x3C,
 ) -> SyntheticBlockResult:
-    """Perform one in-process one-shot bounded write to an acquired loop medium.
+    """Private in-process primitive used only behind the durable gate.
 
     Consumption prevents reuse of this retained capability after success or
-    failure. This function does not provide durable crash/restart replay
-    protection; callers must never automatically replay an ambiguous attempt.
+    failure. This private primitive does not itself provide durable
+    crash/restart replay protection and must only be entered after durable
+    ATTEMPTING evidence has been established.
     """
     if (
         not isinstance(medium, DisposableLoopBlockMedium)

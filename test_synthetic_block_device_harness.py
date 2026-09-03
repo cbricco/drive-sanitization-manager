@@ -585,7 +585,7 @@ class SyntheticBlockHarnessTests(unittest.TestCase):
         )
 
         with patches[0], patches[1], patches[2] as writer, patches[3]:
-            result = synth.execute_bounded_synthetic_pattern_pass(
+            result = synth._execute_bounded_synthetic_pattern_pass_once(
                 medium,
                 offset=offset,
                 length=length,
@@ -620,7 +620,7 @@ class SyntheticBlockHarnessTests(unittest.TestCase):
         )
 
         with patches[0], patches[1], patches[2], patches[3]:
-            result = synth.execute_bounded_synthetic_pattern_pass(
+            result = synth._execute_bounded_synthetic_pattern_pass_once(
                 medium,
                 offset=offset,
                 length=length,
@@ -665,7 +665,7 @@ class SyntheticBlockHarnessTests(unittest.TestCase):
             with self.assertRaises(
                 synth.SyntheticBlockDeviceError
             ):
-                synth.execute_bounded_synthetic_pattern_pass(
+                synth._execute_bounded_synthetic_pattern_pass_once(
                     medium,
                     offset=offset,
                     length=length,
@@ -722,7 +722,7 @@ class SyntheticBlockHarnessTests(unittest.TestCase):
             side_effect=synth.SyntheticBlockDeviceError("boom"),
         ):
             with self.assertRaises(synth.SyntheticBlockDeviceError):
-                synth.execute_bounded_synthetic_pattern_pass(
+                synth._execute_bounded_synthetic_pattern_pass_once(
                     medium,
                     offset=1024 * 1024,
                     length=65536,
@@ -731,7 +731,7 @@ class SyntheticBlockHarnessTests(unittest.TestCase):
         self.assertTrue(medium.consumed)
 
         with self.assertRaises(synth.SyntheticBlockDeviceError):
-            synth.execute_bounded_synthetic_pattern_pass(
+            synth._execute_bounded_synthetic_pattern_pass_once(
                 medium,
                 offset=1024 * 1024,
                 length=65536,
@@ -755,7 +755,7 @@ class SyntheticBlockHarnessTests(unittest.TestCase):
         )
 
         with patches[0], patches[1], patches[2], patches[3]:
-            result = synth.execute_bounded_synthetic_pattern_pass(
+            result = synth._execute_bounded_synthetic_pattern_pass_once(
                 medium,
                 offset=offset,
                 length=length,
@@ -806,7 +806,7 @@ class SyntheticBlockHarnessTests(unittest.TestCase):
         )
 
         with patches[0], patches[1], patches[2], patches[3]:
-            result = synth.execute_bounded_synthetic_pattern_pass(
+            result = synth._execute_bounded_synthetic_pattern_pass_once(
                 medium,
                 offset=offset,
                 length=length,
