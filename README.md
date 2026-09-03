@@ -72,6 +72,18 @@ Planned for later stages:
 10. Separately reviewed destructive-operation integration
 11. Verification and customer reporting
 
+Development safety work has progressed beyond the current non-destructive
+Version 1 workflow. Destructive behavior has been tested only against
+disposable synthetic media: first a private regular-file harness and then a
+separately bounded Linux loop-backed block-device harness. The loop-backed
+harness accepts only newly allocated synthetic loop devices with strict
+identity, backing-file, geometry, mount-state, and bounded-write checks.
+
+This does not mean DSM is ready to sanitize physical drives. Physical-drive
+execution, production execution integration, durable crash/restart protection
+for the synthetic block-device harness, and customer sanitization verification
+remain unimplemented and are not authorized by these synthetic tests.
+
 The project does not claim that a drive has been securely sanitized merely
 because a record exists. Sanitization results must come from an actual,
 verified process.
